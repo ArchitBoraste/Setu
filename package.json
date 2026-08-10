@@ -1,0 +1,12 @@
+{
+  "name": "setu",
+  "private": true,
+  "version": "0.0.1",
+  "description": "Offline-first field data collection platform for community health and NGO field work",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {},
+  "license": "MIT"
+}

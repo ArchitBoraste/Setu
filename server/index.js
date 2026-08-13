@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import { pool } from "./db/index.js";
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -20,6 +21,21 @@ app.get("/api/health", (req, res) => {
     service: "setu-server",
     time: new Date().toISOString(),
   });
+});
+
+app.get("/api/db-health", async (req, res) => {
+  try {
+    // We ask Driver #1 from the pool to run a simple command
+    const [rows] = await pool.query("SHOW TABLES;");
+    
+    res.json({
+      message: "Database connection successful!",
+      tables: rows
+    });
+  } catch (error) {
+    console.error("Database connection failed:", error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // 404 handler — anything not matched above

@@ -233,18 +233,3 @@ Open `http://localhost:5173`. If the setup is right, the page shows the JSON com
 - [ ] Conflict detection and supervisor review
 - [ ] Docker and deployment
 
----
-
-## Team
-
-| Name | Role |
-|---|---|
-| Archit Boraste | Team Lead, Backend and Systems |
-| Ajinkya Ghule | Frontend and UI |
-| Atharva Dhamdhere | Research and Documentation |
-| Abhinavparth Kumar | Testing and Results Analysis |
-
-**College Guide:** Dr. Vijaykumar Bidve, Department of Computer Engineering, Vishwakarma Institute of Technology, Pune
-
-**Sponsored by:** VS Software Lab
-*(Sponsorship is limited to the problem statement and technical mentorship. It does not mean employment or funding.)*

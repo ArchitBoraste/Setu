@@ -8,9 +8,11 @@
     "dev": "node --watch index.js"
   },
   "dependencies": {
+    "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.3",
     "mysql2": "^3.23.3"
   }
 }

@@ -1,6 +1,23 @@
 import express from "express";
 import cors from "cors";
 import { pool } from "./db/index.js";
+import authRoutes from "./routes/auth.js";
+
+// Last-resort visibility. `node --watch` clears the terminal when it restarts
+// a crashed process, so without these a fatal error can scroll away before it
+// is ever read — which is how a crash looks like "nothing in the terminal".
+process.on("unhandledRejection", (reason) => {
+  // With asyncHandler in place a rejecting route no longer lands here; anything
+  // that still does is a promise nobody is awaiting, so log it and stay up.
+  console.error("[unhandledRejection]", reason);
+});
+
+process.on("uncaughtException", (err) => {
+  // Process state is not trustworthy after this, so log and let the supervisor
+  // (node --watch / nodemon) restart us cleanly rather than limping on.
+  console.error("[uncaughtException]", err);
+  process.exit(1);
+});
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -38,9 +55,29 @@ app.get("/api/db-health", async (req, res) => {
   }
 });
 
+app.use("/api/auth", authRoutes);
+
 // 404 handler — anything not matched above
 app.use((req, res) => {
   res.status(404).json({ error: "Route not found" });
+});
+
+// Error handler. The four arguments are what mark this as Express's error
+// middleware, so `next` must stay in the signature even though it is only used
+// for the headers-already-sent case. Everything asyncHandler catches ends here.
+app.use((err, req, res, next) => {
+  console.error(`[error] ${req.method} ${req.originalUrl}`, err);
+
+  // response already streaming — hand back to Express to close the socket
+  if (res.headersSent) return next(err);
+
+  const status = err.status || err.statusCode || 500;
+
+  res.status(status).json({
+    error: status >= 500 ? "Internal server error" : err.message,
+    // the message is useful while developing but can leak internals in prod
+    ...(process.env.NODE_ENV === "production" ? {} : { detail: err.message }),
+  });
 });
 
 app.listen(PORT, () => {

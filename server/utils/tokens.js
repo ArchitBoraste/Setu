@@ -9,7 +9,7 @@ export function signAccessToken(user) {
     {
       sub: user.id,
       role: user.role,
-      org: user.organization_id,
+      org: user.organizationId,
     },
     config.jwt.secret,
     { expiresIn: config.jwt.accessTtl }
@@ -39,7 +39,8 @@ export async function findValidRefreshToken(token) {
   const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
 
   const [[row]] = await pool.query(
-    `SELECT rt.*, u.role, u.organization_id, u.is_active
+    `SELECT rt.user_id AS userId, u.role,
+            u.organization_id AS organizationId, u.is_active AS isActive
        FROM refresh_tokens rt
        JOIN users u ON u.id = rt.user_id
       WHERE rt.token_hash = ?
@@ -49,7 +50,7 @@ export async function findValidRefreshToken(token) {
     [tokenHash]
   );
 
-  return row && row.is_active ? row : null;
+  return row && row.isActive ? row : null;
 }
 
 export async function revokeRefreshToken(token) {

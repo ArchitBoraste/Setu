@@ -21,6 +21,19 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim() !== "";
 }
 
+// The one public shape of a user, shared by /login and /me so they cannot drift.
+// Built field by field rather than spreading the row, so internal columns such
+// as passwordHash and isActive can never leak into a response.
+function toProfile(user) {
+  return {
+    id: user.id,
+    fullName: user.fullName,
+    phone: user.phone,
+    role: user.role,
+    organizationId: user.organizationId,
+  };
+}
+
 router.post(
   "/login",
   asyncHandler(async (req, res) => {
@@ -33,14 +46,17 @@ router.post(
     }
 
     const [[user]] = await pool.query(
-      `SELECT * FROM users WHERE phone = ? AND deleted_at IS NULL`,
+      `SELECT id, full_name AS fullName, phone, role,
+              organization_id AS organizationId,
+              password_hash AS passwordHash, is_active AS isActive
+         FROM users WHERE phone = ? AND deleted_at IS NULL`,
       [phone]
     );
 
     // same message for "no such user" and "wrong password" so nobody can
     // discover which phone numbers are registered
-    const ok = user && (await bcrypt.compare(password, user.password_hash));
-    if (!ok || !user.is_active) {
+    const ok = user && (await bcrypt.compare(password, user.passwordHash));
+    if (!ok || !user.isActive) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
@@ -55,13 +71,7 @@ router.post(
       accessToken: signAccessToken(user),
       refreshToken: await issueRefreshToken(user.id),
       offlineHash,
-      profile: {
-        id: user.id,
-        fullName: user.full_name,
-        phone: user.phone,
-        role: user.role,
-        organizationId: user.organization_id,
-      },
+      profile: toProfile(user),
     });
   })
 );
@@ -83,9 +93,9 @@ router.post(
     await revokeRefreshToken(refreshToken);
 
     const user = {
-      id: row.user_id,
+      id: row.userId,
       role: row.role,
-      organization_id: row.organization_id,
+      organizationId: row.organizationId,
     };
 
     res.json({
@@ -110,13 +120,14 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const [[user]] = await pool.query(
-      `SELECT id, full_name, phone, role, organization_id
-       FROM users WHERE id = ? AND deleted_at IS NULL`,
+      `SELECT id, full_name AS fullName, phone, role,
+              organization_id AS organizationId
+         FROM users WHERE id = ? AND deleted_at IS NULL`,
       [req.user.id]
     );
 
     if (!user) return res.status(404).json({ error: "User not found" });
-    res.json(user);
+    res.json(toProfile(user));
   })
 );
 

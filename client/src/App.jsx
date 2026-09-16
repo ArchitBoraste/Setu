@@ -1,61 +1,184 @@
 import { useEffect, useState } from "react";
+import {
+  getCachedUser,
+  login,
+  logout,
+  removeAccountFromDevice,
+} from "./auth/authService.js";
 
-export default function App() {
-  const [health, setHealth] = useState(null);
-  const [error, setError] = useState(null);
+// Temporary screen that proves the auth flow works. The real UI replaces it.
+
+const styles = {
+  page: { fontFamily: "system-ui", padding: "2rem", maxWidth: 420 },
+  field: { display: "block", width: "100%", padding: "0.5rem", marginTop: 4 },
+  label: { display: "block", marginBottom: "0.75rem" },
+  error: { color: "crimson" },
+  badge: (online) => ({
+    display: "inline-block",
+    padding: "0.15rem 0.6rem",
+    borderRadius: 999,
+    fontSize: 14,
+    color: "#fff",
+    background: online ? "seagreen" : "gray",
+  }),
+};
+
+// Reflects the browser's "online"/"offline" events. This is only a display hint:
+// the browser reports online whenever a network interface is up, even with no
+// internet behind it, so authService never uses this to decide anything.
+function useBrowserOnline() {
+  const [online, setOnline] = useState(() => navigator.onLine);
 
   useEffect(() => {
-    //Here we have puth the relative path... Vite proxies this to Express. 
-    fetch("/api/health")
-
-      .then((res) => {
-        if (!res.ok) throw new Error(`Server responded ${res.status}`);
-        //from backend express we are receiving this response:
-        // {
-        //   status: "ok",
-        //   service: "setu-server",
-        //   time: new Date().toISOString(),
-        // }
-
-        //but in the response we get two things:
-
-        //1. The Shipping Label (HTTP Protocol): This is the metadata about the delivery. It has an HTTP Status Code 
-        //(like 200 for Success, 404 for Not Found, 500 for Server Error).
-
-        //2. The Box Contents (JSON Data): This is the actual stuff inside the box ({ status: "ok", service: "setu-server" })
-
-        //the res.ok here is referring to the http protocol, equals true if the HTTP status is anywhere between 200 and 299 
-        //(which means success). It equals false if the status is 400 or 500+
-
-        //if there is a problem we have set the backend code app.use((req,res)=>{res.status(404)})....hence res.ok will be false
-
-
-        return res.json();
-      })
-      .then((data)=>{
-        setHealth(data)
-      })
-      .catch((err) => setError(err.message));
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
   }, []);
 
-  return (
-    <div style={{ fontFamily: "system-ui", padding: "2rem" }}>
-      <h1>Setu</h1>
-      <p>Offline-First Field Data Collection Platform</p>
+  return online;
+}
 
-      <h2>Server connection</h2>
-      {error && <p style={{ color: "crimson" }}>Failed: {error}</p>}
-      {!error && !health && <p>Checking...</p>}
-      {health && (
-        <pre
-          style={{
-            background: "#f4f4f4",
-            padding: "1rem",
-            borderRadius: "6px",
-          }}
-        >
-          {JSON.stringify(health, null, 2)}
-        </pre>
+function LoginForm({ onSubmit, busy }) {
+  const [phone, setPhone] = useState("");
+  const [password, setPassword] = useState("");
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    await onSubmit(phone, password);
+    setPassword("");
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <label style={styles.label}>
+        Phone
+        <input
+          style={styles.field}
+          type="tel"
+          autoComplete="username"
+          value={phone}
+          onChange={(e) => setPhone(e.target.value)}
+        />
+      </label>
+      <label style={styles.label}>
+        Password
+        <input
+          style={styles.field}
+          type="password"
+          autoComplete="current-password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+        />
+      </label>
+      <button type="submit" disabled={busy}>
+        {busy ? "Signing in…" : "Sign in"}
+      </button>
+    </form>
+  );
+}
+
+function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
+  return (
+    <div>
+      <p>
+        Signed in as <strong>{user.fullName}</strong> ({user.role})
+        <br />
+        Phone {user.phone} · via {mode}
+      </p>
+      <button onClick={onSignOut} disabled={busy}>
+        Sign out
+      </button>{" "}
+      <button onClick={onRemove} disabled={busy}>
+        Remove account from device
+      </button>
+    </div>
+  );
+}
+
+export default function App() {
+  const online = useBrowserOnline();
+  const [restoring, setRestoring] = useState(true);
+  const [session, setSession] = useState(null); // { user, mode } | null
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    getCachedUser()
+      .then((user) => {
+        if (!cancelled && user) setSession({ user, mode: "restored session" });
+      })
+      .catch((err) => {
+        if (!cancelled) setError(`Could not read local session: ${err.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Runs an auth action with the busy flag set and the error shown on failure.
+  async function run(action) {
+    setBusy(true);
+    setError(null);
+    try {
+      await action();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const handleLogin = (phone, password) =>
+    run(async () => setSession(await login(phone, password)));
+
+  const handleSignOut = () =>
+    run(async () => {
+      await logout();
+      setSession(null);
+    });
+
+  const handleRemove = () => {
+    if (!window.confirm("Remove this account and all its local data from the device?")) {
+      return;
+    }
+    return run(async () => {
+      await removeAccountFromDevice();
+      setSession(null);
+    });
+  };
+
+  return (
+    <div style={styles.page}>
+      <h1>Setu</h1>
+      <p>
+        <span style={styles.badge(online)}>{online ? "Online" : "Offline"}</span>
+      </p>
+
+      {error && <p style={styles.error}>{error}</p>}
+
+      {restoring ? (
+        <p>Loading…</p>
+      ) : session ? (
+        <SignedIn
+          user={session.user}
+          mode={session.mode}
+          onSignOut={handleSignOut}
+          onRemove={handleRemove}
+          busy={busy}
+        />
+      ) : (
+        <LoginForm onSubmit={handleLogin} busy={busy} />
       )}
     </div>
   );

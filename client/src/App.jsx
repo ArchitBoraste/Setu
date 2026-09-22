@@ -5,6 +5,7 @@ import {
   logout,
   removeAccountFromDevice,
 } from "./auth/authService.js";
+import UpdatePrompt from "./components/UpdatePrompt.jsx";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
 
@@ -180,6 +181,8 @@ export default function App() {
       ) : (
         <LoginForm onSubmit={handleLogin} busy={busy} />
       )}
+
+      <UpdatePrompt />
     </div>
   );
 }

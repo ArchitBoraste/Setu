@@ -1,5 +1,7 @@
 node_modules/
 dist/
+# service worker written by `npm run dev` (vite-plugin-pwa devOptions)
+dev-dist/
 build/
 .env
 .env.local

@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import { db, getAuthRow } from "../db/index.js";
 import { apiFetch, ApiError, NetworkError } from "../lib/api.js";
+import { ensurePersistentStorage } from "../lib/storage.js";
 
 // How long a hash cached from an online login keeps working offline. A lost or
 // stolen phone should stop opening after this, whatever the thief tries.
@@ -102,6 +103,12 @@ async function loginOnline({ phone, password }) {
   };
 
   await replaceAuthRow(row);
+
+  // Not awaited: signing in must not wait on a permission check, and a refusal
+  // changes nothing about this login. See lib/storage.js for why the request
+  // happens here rather than at startup.
+  void ensurePersistentStorage();
+
   return toUser(row);
 }
 

@@ -31,6 +31,17 @@ app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 
 app.use(express.json({ limit: "5mb" })); //raising above the default limit as field records can carry compressed photos later
 
+// The service worker routes /api as NetworkOnly, but that only keeps responses
+// out of the *service worker's* cache. The browser's own HTTP cache is a separate
+// store the worker never sees, and without a directive it is free to reuse a
+// response heuristically — which could hand a field worker another user's
+// profile after a device handover, or a stale record they just edited. One
+// header on the whole prefix is easier to keep right than per-route rules.
+app.use("/api", (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  next();
+});
+
 // every API route lives under /api so the proxy has one clean prefix to match
 app.get("/api/health", (req, res) => {
   res.json({

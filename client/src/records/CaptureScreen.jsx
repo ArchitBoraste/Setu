@@ -263,6 +263,8 @@ function ConflictCompare({ record }) {
 function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
   const isConflict = record.syncState === SYNC_STATE.CONFLICT;
   const isRejected = record.syncState === SYNC_STATE.REJECTED;
+  // The server's copy is a tombstone while this device still holds the row.
+  const serverDeleted = isConflict && record.serverConflict?.deletedAt != null;
 
   return (
     <li style={styles.row}>
@@ -274,8 +276,24 @@ function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
 
       {isConflict && (
         <p style={styles.muted}>
-          Someone else changed this record on the server before your copy arrived.
-          Both versions are kept — a supervisor decides which one stands.{" "}
+          {/* A deletion and an edit are not the same news. Telling a worker
+              "someone changed this" when the record was actually deleted leaves
+              them to discover it in the comparison grid, and the thing they most
+              need to know — that their own copy is the only one left — is the
+              thing the sentence omits. */}
+          {serverDeleted ? (
+            <>
+              This record was <strong>deleted on the server</strong> while your
+              changes were still on this phone. Your copy has been kept and will
+              not be sent back until someone decides which is right.
+            </>
+          ) : (
+            <>
+              Someone else changed this record on the server before your copy
+              arrived. Both versions are kept — a supervisor decides which one
+              stands.
+            </>
+          )}{" "}
           <button onClick={() => onToggle(record.id)}>
             {expanded ? "Hide both versions" : "Compare both versions"}
           </button>
@@ -303,11 +321,19 @@ function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
   );
 }
 
-function lastSyncedLabel(lastSyncAt) {
-  if (!lastSyncAt) return "Never synced";
-  // The device clock, and only ever shown, never compared. The sync cursor is
-  // the server's timestamp and lives elsewhere.
-  return `Last synced ${new Date(lastSyncAt).toLocaleString()}`;
+/**
+ * The server's own timestamp, shown as the server wrote it.
+ *
+ * Deliberately sliced rather than passed through new Date(). The string carries
+ * no timezone, so reparsing it would read it in the phone's zone — and a phone
+ * with a wrong clock or a changed region setting would then display a confident,
+ * wrong time for an event that happened on another machine. Sync stopped
+ * depending on this device's clock; the label should not quietly put it back.
+ */
+function lastSyncedLabel(serverSyncedAt) {
+  if (!serverSyncedAt) return "Never synced";
+  // "2026-09-22 15:16:21.934000" -> "2026-09-22 15:16"
+  return `Last synced ${serverSyncedAt.slice(0, 16)} (server time)`;
 }
 
 /**
@@ -369,14 +395,28 @@ function SyncNotice({ summary }) {
     );
   }
 
-  if (summary.attempted === 0) {
-    return <p style={styles.notice()}>Nothing waiting to sync.</p>;
-  }
-
-  const parts = [`${summary.accepted} sent`];
+  const parts = [];
+  if (summary.attempted > 0) parts.push(`${summary.accepted} sent`);
   if (summary.conflicts) parts.push(`${summary.conflicts} in conflict`);
   if (summary.rejected) parts.push(`${summary.rejected} refused`);
   if (summary.failed) parts.push(`${summary.failed} to retry`);
+
+  // The pull side. `received` counts rows new to this device rather than
+  // everything the window returned, because "12 received" when eleven were
+  // already here reads as a problem.
+  if (summary.received) parts.push(`${summary.received} received`);
+  if (summary.applied > summary.received) {
+    parts.push(`${summary.applied - summary.received} updated`);
+  }
+  if (summary.pullConflicts) parts.push(`${summary.pullConflicts} needs review`);
+  if (summary.heldBack) parts.push(`${summary.heldBack} kept local`);
+
+  if (parts.length === 0) {
+    // A sync that pushed nothing and received nothing still reached the server,
+    // which is worth saying plainly — the worker pressed a button and deserves
+    // an answer other than silence.
+    return <p style={styles.notice()}>Up to date. Nothing to send or receive.</p>;
+  }
 
   return <p style={styles.notice()}>{parts.join(" · ")}</p>;
 }

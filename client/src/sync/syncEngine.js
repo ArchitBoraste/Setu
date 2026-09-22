@@ -5,20 +5,18 @@ import {
   NotAuthenticatedError,
   apiFetch,
 } from "../lib/api.js";
-import { SYNC_STATE } from "../records/recordService.js";
+import { SYNC_STATE } from "../records/syncState.js";
+import { PULL_ACTION, classifyPulledRow } from "./pullRules.js";
 
 // The only file in client/src that talks to the server about records. Capture
 // writes to IndexedDB and returns; this moves what is there to the server on its
 // own schedule, and nothing on the capture path waits for it.
 //
-// PUSH BEFORE PULL. This step is push only, but the order is decided here
-// because reversing it later would lose data: a pull applied first overwrites
-// rows this device has changed but not yet sent, and the edit disappears without
-// anyone seeing a conflict. Step 11 adds pullChanges() and calls it from
-// runSync() AFTER pushPending(), which is why runSync is a sequence of phases
-// rather than a single function body.
+// A full sync is pushPending() then pullChanges(), in that order, and the reason
+// is written out at the call site in executeSync().
 
 const PUSH_PATH = "/api/sync/push";
+const PULL_PATH = "/api/sync/pull";
 
 // Well under the server's 200 cap. Smaller batches finish inside the short
 // connectivity windows a field phone actually gets, and a dropped response costs
@@ -29,10 +27,39 @@ const MAX_PUSH_ATTEMPTS = 4;
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 30_000;
 
-// The device clock, stored for display only. It is NOT a cursor and must never
-// become one: step 11's delta cursor is the server's timestamp, kept separately,
-// because a phone whose clock runs fast would skip records forever.
-const LAST_SYNC_META_KEY = "lastSyncAt";
+// A page well under the server's 500 cap. Each page is applied in its own
+// transaction, so smaller pages mean less work thrown away when a pull is
+// interrupted halfway down a village's worth of records.
+const PULL_PAGE_SIZE = 100;
+
+/**
+ * THE DELTA CURSOR. The single most important value this device stores.
+ *
+ * It holds the string the SERVER returned as `serverTime`, byte for byte. It is
+ * never parsed, never turned into a Date, never formatted and re-read, and never
+ * compared against anything the device's own clock produced.
+ *
+ * Reparsing it would be enough to break it. The string carries no timezone, so
+ * new Date(...) reads it in whatever zone the phone is set to; a device that
+ * crosses a border, or whose user changes the setting, would shift its own
+ * cursor by hours and either re-download everything or skip a day of records
+ * permanently. Kept opaque, it is simply a token the server issued and the
+ * device hands back.
+ *
+ * Written ONLY after the final page of a pull has been applied.
+ */
+const SYNC_CURSOR_META_KEY = "syncCursor";
+
+// When the server last answered, as the SERVER dated it — not Date.now().
+// Shown to the worker, and shown in the server's own words for the same reason
+// the cursor is: a phone with a wrong clock would otherwise report a confident,
+// wrong time for something that happened on another machine entirely.
+const LAST_SYNC_META_KEY = "serverSyncedAt";
+
+// The device-clock value this key used to hold, before the server's timestamp
+// replaced it. Deleted on the next successful sync so no device is left carrying
+// a number under a name that now means a string.
+const LEGACY_DEVICE_CLOCK_KEY = "lastSyncAt";
 
 // Fired after every sync attempt so any screen showing record state can re-read.
 // A window event rather than a callback list: sync can start from a button in
@@ -46,9 +73,18 @@ export const PUSH_STATUS = {
   FAILED: "failed",
 };
 
+/**
+ * When the server last answered this device, in the server's own words.
+ * A string such as "2026-09-22 15:16:21.934000", for display only.
+ */
 export async function getLastSyncAt() {
   const row = await db.meta.get(LAST_SYNC_META_KEY);
-  return row?.value ?? null;
+  return typeof row?.value === "string" ? row.value : null;
+}
+
+async function getSyncCursor() {
+  const row = await db.meta.get(SYNC_CURSOR_META_KEY);
+  return typeof row?.value === "string" ? row.value : null;
 }
 
 function sleep(ms) {
@@ -246,6 +282,188 @@ async function pushPending(user, summary) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// PULL
+// ---------------------------------------------------------------------------
+
+/**
+ * One page of the delta window.
+ *
+ * Retries on transport failure only, exactly as the push does: a NetworkError
+ * means nothing was heard back, while an ApiError is the server's considered
+ * answer and asking again only gets it repeated.
+ *
+ * A pull is naturally idempotent — it reads a closed window and writes nothing
+ * on the server — so an interrupted page can simply be asked for again.
+ */
+async function pullPageWithRetry({ since, until, after, limit }) {
+  const params = new URLSearchParams();
+  if (since) params.set("since", since);
+  if (until) params.set("until", until);
+  if (after) {
+    params.set("afterUpdatedAt", after.updatedAt);
+    params.set("afterId", after.id);
+  }
+  params.set("limit", String(limit));
+
+  let attempt = 0;
+  for (;;) {
+    try {
+      return await apiFetch(`${PULL_PATH}?${params.toString()}`);
+    } catch (error) {
+      if (!(error instanceof NetworkError)) throw error;
+
+      attempt += 1;
+      if (attempt >= MAX_PUSH_ATTEMPTS) throw error;
+      await sleep(backoffDelay(attempt));
+    }
+  }
+}
+
+/**
+ * The server's copy, shaped for the local store.
+ *
+ * localUpdatedAt is the device clock and orders the worker's list; it means
+ * "when this device last wrote this row", which a pull is. It is emphatically
+ * not a cursor — that is serverUpdatedAt, which is the server's string, stored
+ * unchanged.
+ */
+function toLocalRow(remote, organizationId, previous) {
+  return {
+    id: remote.id,
+    organizationId,
+    createdBy: remote.createdBy,
+    deviceId: remote.deviceId,
+    formType: remote.formType,
+    formVersion: remote.formVersion,
+    payload: remote.payload,
+    version: remote.version,
+    createdAt: previous?.createdAt ?? Date.now(),
+    localUpdatedAt: Date.now(),
+    serverUpdatedAt: remote.updatedAt,
+    // The server has confirmed this version by definition: it just sent it.
+    syncedVersion: remote.version,
+    serverConflict: null,
+    // A tombstone carries the server's deletion time as a string, where a local
+    // delete writes a number. Nothing compares the two — deletedAt is only ever
+    // tested for null — and keeping the server's value means a pulled deletion
+    // is dated by the machine that actually made the decision.
+    deletedAt: remote.deletedAt,
+    syncState: SYNC_STATE.SYNCED,
+    syncError: null,
+  };
+}
+
+/**
+ * Applies one page, in one Dexie transaction.
+ *
+ * The transaction boundary is the page, and it matters: a pull that dies halfway
+ * through writing a page must leave that page entirely unapplied, because the
+ * cursor is only written after the LAST page. Half a page applied with the
+ * cursor unmoved is harmless — it gets re-fetched — but half a page applied
+ * with a partially-updated row is not.
+ */
+async function applyPulledPage(user, records, summary) {
+  if (records.length === 0) return;
+
+  await db.transaction("rw", db.records, async () => {
+    for (const remote of records) {
+      const local = await db.records.get(remote.id);
+      const { action } = classifyPulledRow(local ?? null, remote);
+      summary.pulled += 1;
+
+      if (action === PULL_ACTION.SKIP) continue;
+
+      if (action === PULL_ACTION.KEEP_LOCAL) {
+        // Deliberately nothing. See pullRules.js — touching syncedVersion here
+        // would make the next push silently overwrite another device's edit.
+        summary.heldBack += 1;
+        continue;
+      }
+
+      if (action === PULL_ACTION.REFRESH_CONFLICT) {
+        await db.records.update(remote.id, { serverConflict: remote });
+        summary.pullConflicts += 1;
+        continue;
+      }
+
+      if (action === PULL_ACTION.DELETE_CONFLICT) {
+        // The worker's row is left exactly as it is; only its state changes, and
+        // the server's tombstone is stored beside it so the comparison view can
+        // show what happened. This takes the row out of the push queue, which is
+        // what stops the device recreating a record somebody deleted on purpose.
+        await db.records.update(remote.id, {
+          syncState: SYNC_STATE.CONFLICT,
+          serverConflict: remote,
+        });
+        summary.pullConflicts += 1;
+        continue;
+      }
+
+      // INSERT and OVERWRITE. organizationId comes from the signed-in user
+      // rather than the wire: the server scopes the query to that organisation
+      // already, and the row has no business carrying a second opinion.
+      await db.records.put(toLocalRow(remote, user.organizationId, local));
+      summary.applied += 1;
+      if (!local) summary.received += 1;
+    }
+  });
+}
+
+/**
+ * Walks the delta window to its end, then moves the cursor.
+ *
+ * The cursor is written ONCE, after the final page. Advancing it per page would
+ * mean an interrupted pull — a tunnel, a flat battery, a closed tab — leaves the
+ * cursor past records that were never fetched, and the next window starts above
+ * them. They are not retried, because nothing knows they were missed.
+ */
+async function pullChanges(user, summary) {
+  const since = await getSyncCursor();
+
+  // Fixed by the first page and sent back on every page after it, so all pages
+  // of one sync read ONE closed interval. If each page took a fresh upper edge,
+  // the interval the stored cursor claims to cover would not be the interval the
+  // earlier pages were actually drawn from.
+  let until = null;
+  let after = null;
+  let pages = 0;
+
+  for (;;) {
+    const page = await pullPageWithRetry({
+      since,
+      until,
+      after,
+      limit: PULL_PAGE_SIZE,
+    });
+
+    until ??= page.serverTime;
+    await applyPulledPage(user, page.records ?? [], summary);
+    pages += 1;
+
+    // nextCursor missing while hasMore is set would loop forever on the same
+    // page. Stopping leaves the cursor unmoved, so the window is simply re-read
+    // next time rather than partially skipped.
+    if (!page.hasMore || !page.nextCursor) break;
+    after = page.nextCursor;
+  }
+
+  summary.pullPages = pages;
+
+  // Only now, and only forward. resolveWindow() already refuses to hand back an
+  // edge below the cursor it was given, but a cursor that moves backwards
+  // re-delivers rows the device has already applied, so the device checks too
+  // rather than trusting a response to be well-formed.
+  if (until && (!since || until > since)) {
+    await db.meta.put({ key: SYNC_CURSOR_META_KEY, value: until });
+  }
+
+  if (until) {
+    await db.meta.put({ key: LAST_SYNC_META_KEY, value: until });
+    await db.meta.delete(LEGACY_DEVICE_CLOCK_KEY);
+  }
+}
+
 function emptySummary() {
   return {
     attempted: 0,
@@ -253,6 +471,16 @@ function emptySummary() {
     conflicts: 0,
     rejected: 0,
     failed: 0,
+    // Pull side. `pulled` is everything the window returned; `received` counts
+    // only rows this device had never seen, which is the number a worker cares
+    // about. `heldBack` is rows the server sent that were deliberately NOT
+    // applied because this device holds unsent work for them.
+    pulled: 0,
+    applied: 0,
+    received: 0,
+    heldBack: 0,
+    pullConflicts: 0,
+    pullPages: 0,
     // The offline-login gap: tokens are null, so the server cannot be reached as
     // anybody. Not an error to show in red — an instruction.
     needsOnlineSignIn: false,
@@ -271,17 +499,23 @@ async function executeSync() {
   }
 
   try {
+    // PUSH, THEN PULL. Not a preference — the other order silently destroys
+    // work.
+    //
+    // Pulling first hands this device the server's copy of rows it is about to
+    // overwrite. Those copies are, by definition, older than the local edits
+    // waiting to go out, so applying them either overwrites unsent work outright
+    // or raises a conflict against data the device was seconds away from
+    // superseding. The worker is then asked to reconcile their own record
+    // against a version of it that no longer matters.
+    //
+    // Pushing first means the server has already accepted whatever this device
+    // had to say before it answers the question "what changed?". Rows that come
+    // back are genuinely other people's changes, and a row still pending after
+    // the push is pending because the push failed — which pullRules.js treats as
+    // the exception it is, rather than the normal case it would become.
     await pushPending(user, summary);
-
-    // Step 11 pulls here, after the push has finished. See the note at the top
-    // of this file for why the order is not negotiable.
-
-    // Only set once the server has actually answered. "Last synced" is a claim
-    // that data reached the server, and a run that never got that far must not
-    // make it.
-    if (summary.attempted > 0) {
-      await db.meta.put({ key: LAST_SYNC_META_KEY, value: Date.now() });
-    }
+    await pullChanges(user, summary);
   } catch (error) {
     // THE OFFLINE-LOGIN GAP.
     //

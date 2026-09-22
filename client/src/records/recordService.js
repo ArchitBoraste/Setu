@@ -2,24 +2,15 @@ import Dexie from "dexie";
 import { db, isDatabaseOutdated } from "../db/index.js";
 import { getCachedUser } from "../auth/authService.js";
 import { getDeviceId, newUuid } from "../lib/device.js";
+import { SYNC_STATE } from "./syncState.js";
 
 // No network code lives in this file, by design. Capture writes to IndexedDB and
 // returns; the sync layer moves rows to the server on its own schedule.
 
-export const SYNC_STATE = {
-  // Local changes the server has not accepted yet.
-  PENDING: "pending",
-  // Server and device agree, as of serverUpdatedAt.
-  SYNCED: "synced",
-  // Both sides changed the row since the last sync. Needs a human or a rule.
-  CONFLICT: "conflict",
-  // The server refused the row outright — a malformed payload, a version it
-  // never issued, a row belonging to someone else. Held apart from PENDING so
-  // the push queue, which selects only PENDING, can never pick it up again:
-  // nothing about resending an invalid record makes it valid. The reason lives
-  // in the row's syncError, and the row itself is never deleted.
-  REJECTED: "rejected",
-};
+// Defined in its own module so the pull decision table can use it without
+// dragging Dexie in, and re-exported here because this is where every caller
+// already expects to find it.
+export { SYNC_STATE };
 
 /**
  * Payload value rule, for this form and every form after it:

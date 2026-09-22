@@ -11,17 +11,26 @@ import {
   classifyPush,
   validateEnvelope,
 } from "../sync/pushRules.js";
+import {
+  PULL_COMMIT_LAG_MS,
+  keysetFrom,
+  resolveWindow,
+  validatePullQuery,
+} from "../sync/pullRules.js";
 
 const router = express.Router();
 
-// PUSH BEFORE PULL, and this route is only the push half.
+// PUSH BEFORE PULL.
 //
 // A device sends everything it has changed before it asks for anything back. The
 // other order loses work: pull first and the device overwrites its own unsent
 // edits with the server's older copy of the same row, and the edit is gone
 // before anyone knew it existed. Push first and the worst case is a conflict,
-// which is a row two people can still look at. Step 11 adds the pull as a
-// separate endpoint that the client calls after this one.
+// which is a row two people can still look at.
+//
+// Both halves live here, but they are independent endpoints — the ORDER is the
+// client's to keep, in runSync(), because only the client knows a sync is one
+// thing rather than two requests.
 
 // Timestamps leave here as text in MySQL's own DATETIME format, produced by the
 // server's clock and never parsed by a device.
@@ -388,6 +397,165 @@ router.post(
     } finally {
       conn.release();
     }
+  })
+);
+
+// ---------------------------------------------------------------------------
+// PULL
+// ---------------------------------------------------------------------------
+
+// What a device receives. organization_id is deliberately absent: the device
+// belongs to exactly one organisation and already knows which, so sending it
+// back is one more field on a phone that can be lost.
+const PULL_COLUMNS = `
+  id,
+  created_by   AS createdBy,
+  device_id    AS deviceId,
+  form_type    AS formType,
+  form_version AS formVersion,
+  payload,
+  version,
+  DATE_FORMAT(created_at, '${SERVER_TIME_FORMAT}') AS createdAt,
+  DATE_FORMAT(updated_at, '${SERVER_TIME_FORMAT}') AS updatedAt,
+  DATE_FORMAT(deleted_at, '${SERVER_TIME_FORMAT}') AS deletedAt`;
+
+// The window and the keyset, identical in both queries below.
+//
+//   updated_at >  ?   the lower edge, EXCLUSIVE, and always a timestamp this
+//                     server minted. Never the device's clock: a phone running
+//                     four minutes fast would store its own time as the cursor,
+//                     and every row the server wrote in those four minutes falls
+//                     below the next window's floor forever. Cursors only move
+//                     forward, so nothing ever goes back for them.
+//
+//   updated_at <= ?   the upper edge, INCLUSIVE, so consecutive windows tile:
+//                     (a, b] then (b, c] covers every instant exactly once, with
+//                     no gap to fall through and no overlap to re-deliver.
+//                     Without an upper edge, a row committed by another worker
+//                     while this query is running can land after the rows it
+//                     selected but before the clock the device will store —
+//                     outside this window and below every future one.
+//
+//   (updated_at, id)  the keyset. See ORDER BY.
+//
+// Soft-deleted rows are NOT filtered out. A tombstone is a change like any
+// other, and it is the only way a device with no network learns that a record
+// is gone: a row that merely stops appearing reads as "no change", and the
+// device keeps its copy and pushes it back.
+const PULL_WINDOW = `
+     updated_at >  ?
+ AND updated_at <= ?
+ AND (updated_at > ? OR (updated_at = ? AND id > ?))`;
+
+// ORDER BY both columns, and paginate by keyset rather than OFFSET.
+//
+// updated_at alone is not a total order. A batch push writes several rows from
+// one NOW(3) reading, so ties inside a single millisecond are routine rather
+// than exotic — and a page boundary landing in the middle of a tied group is
+// resolved by whatever order the storage engine felt like, which differs between
+// the two queries. Rows in that group get skipped or sent twice. Adding the
+// primary key breaks every tie, and the order becomes total and stable.
+//
+// OFFSET is wrong here for a different reason: it counts rows rather than naming
+// one. The set being paged over is live — this is a sync engine, other devices
+// are pushing into the same window as the pages are fetched — so a row inserted
+// before the offset shifts everything after it down by one, and the row that was
+// about to be read is stepped over. Asking for "the 200 rows after this exact
+// (timestamp, id)" cannot skip anything, because it names a position in the data
+// instead of a count of rows someone else can change. It also stays fast at any
+// depth, where OFFSET 50000 makes MySQL walk and discard fifty thousand rows.
+const PULL_ORDER = `ORDER BY updated_at ASC, id ASC LIMIT ?`;
+
+// A field worker pulls only what they captured. A supervisor pulls the
+// organisation.
+//
+// This is a containment boundary, not a convenience. A field phone is the most
+// losable object in the system — pockets, buses, rivers — and the scoping means
+// the worst case for one is one worker's own households, not an organisation's
+// entire register. The role is read from the verified JWT, never from anything
+// the request carries, so a device cannot widen its own blast radius by asking.
+const PULL_OWN_RECORDS = `
+  SELECT ${PULL_COLUMNS}
+    FROM records
+   WHERE organization_id = ?
+     AND created_by = ?
+     AND ${PULL_WINDOW}
+   ${PULL_ORDER}`;
+
+const PULL_ORGANIZATION = `
+  SELECT ${PULL_COLUMNS}
+    FROM records
+   WHERE organization_id = ?
+     AND ${PULL_WINDOW}
+   ${PULL_ORDER}`;
+
+/**
+ * Everything in scope that changed inside one closed time window.
+ *
+ * A first sync sends no cursor, which makes the window (epoch, now] — the whole
+ * dataset — so the response is paginated and the client walks it page by page.
+ */
+router.get(
+  "/pull",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = validatePullQuery(req.query);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const { since, requestedUntil, afterUpdatedAt, afterId, pageSize } = parsed.value;
+
+    // BEFORE the rows are selected, never after. Reading the clock afterwards
+    // would hand back an edge later than the snapshot the query actually saw,
+    // and everything committed in between would fall into no window at all.
+    //
+    // Held PULL_COMMIT_LAG_MS behind the real clock so a transaction that was
+    // open when this ran cannot commit a row underneath the edge afterwards —
+    // see the note on that constant for why that particular gap is permanent.
+    const [[{ safeNow }]] = await pool.query(
+      `SELECT DATE_FORMAT(DATE_SUB(NOW(3), INTERVAL ? MICROSECOND), '${SERVER_TIME_FORMAT}') AS safeNow`,
+      [PULL_COMMIT_LAG_MS * 1000]
+    );
+
+    const { since: from, until } = resolveWindow(since, requestedUntil, safeNow);
+    const keyset = keysetFrom({ since: from, afterUpdatedAt, afterId });
+
+    const windowParams = [from, until, keyset.updatedAt, keyset.updatedAt, keyset.id];
+
+    // One row more than asked for. Its presence is the hasMore answer, which
+    // costs nothing, where a separate COUNT over the same window would double the
+    // work and could disagree with the page it describes.
+    const probeSize = pageSize + 1;
+
+    // Two complete statements chosen by role, rather than one assembled from
+    // fragments. Both are fully parameterised, and each keeps a WHERE clause the
+    // matching index can actually drive.
+    const [rows] =
+      req.user.role === "field_worker"
+        ? await pool.query(PULL_OWN_RECORDS, [
+            req.user.organizationId,
+            req.user.id,
+            ...windowParams,
+            probeSize,
+          ])
+        : await pool.query(PULL_ORGANIZATION, [
+            req.user.organizationId,
+            ...windowParams,
+            probeSize,
+          ]);
+
+    const hasMore = rows.length > pageSize;
+    const records = hasMore ? rows.slice(0, pageSize) : rows;
+    const last = records[records.length - 1];
+
+    res.json({
+      records,
+      // The upper edge in force for THIS window. The client sends it back on
+      // every following page so one sync reads one fixed interval, and stores it
+      // as the next cursor only once the last page has been applied.
+      serverTime: until,
+      hasMore,
+      nextCursor: hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null,
+    });
   })
 );
 

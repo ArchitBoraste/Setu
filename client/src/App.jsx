@@ -6,6 +6,8 @@ import {
   removeAccountFromDevice,
 } from "./auth/authService.js";
 import UpdatePrompt from "./components/UpdatePrompt.jsx";
+import CaptureScreen from "./records/CaptureScreen.jsx";
+import { DATABASE_OUTDATED_EVENT } from "./db/index.js";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
 
@@ -97,7 +99,31 @@ function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
       <button onClick={onRemove} disabled={busy}>
         Remove account from device
       </button>
+
+      <CaptureScreen />
     </div>
+  );
+}
+
+// The database was closed so another tab running newer code could upgrade the
+// schema (see db/index.js). Every query fails until this tab reloads, so say so
+// instead of letting the screen fill with read errors.
+function DatabaseOutdatedBanner() {
+  const [outdated, setOutdated] = useState(false);
+
+  useEffect(() => {
+    const onOutdated = () => setOutdated(true);
+    window.addEventListener(DATABASE_OUTDATED_EVENT, onOutdated);
+    return () => window.removeEventListener(DATABASE_OUTDATED_EVENT, onOutdated);
+  }, []);
+
+  if (!outdated) return null;
+
+  return (
+    <p style={{ background: "#b45309", color: "#fff", padding: "0.5rem 0.75rem" }}>
+      Setu was updated in another tab.{" "}
+      <button onClick={() => window.location.reload()}>Reload</button>
+    </p>
   );
 }
 
@@ -165,6 +191,8 @@ export default function App() {
       <p>
         <span style={styles.badge(online)}>{online ? "Online" : "Offline"}</span>
       </p>
+
+      <DatabaseOutdatedBanner />
 
       {error && <p style={styles.error}>{error}</p>}
 

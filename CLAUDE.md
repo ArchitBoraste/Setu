@@ -35,10 +35,24 @@ No code in `client/src` may assume the internet exists. If a feature breaks when
 
 ## Known gaps (do not "fix" silently — raise them first)
 
-- Offline login leaves tokens null, so sync will fail until the worker signs in online again. Needs an explicit reconnect prompt.
-- A different user logging in on a shared device replaces `authCache` but leaves the previous worker's unsynced records.
+Auth
 - No rate limit on `POST /api/auth/login`.
 - Login is not constant-time: a missing user skips bcrypt and returns much faster than a wrong password, which leaks which phone numbers are registered.
+- On a shared phone, a second worker cannot sync the first worker's unsent records and can wipe them via Remove account; the screen warns but cannot prevent it.
+
+Sync
+- Idempotency remembers one writer: `records.device_id` holds only the last accepted device, so a retry that outlives another device's edit is filed as a false conflict instead of a replay.
+- `PULL_COMMIT_LAG_MS` (1s) is a judgement, not a proof: a push or resolve transaction held open longer can commit below a cursor already handed out, and that row is never delivered.
+- Tombstones are never pruned, on the server or on any device that pulled them.
+- Supervisors and admins pull the whole organisation onto one device, so one lost supervisor phone exposes every household.
+- The sync cursor is one per device, not per user: another user syncing on a shared phone moves it past records and resolutions the first user never pulled, so those never arrive — and a conflicted row waiting on one stays frozen.
+- `records` keeps no history: an ordinary accepted push overwrites the previous payload with no copy kept; only resolutions preserve what they replace (`superseded_*`).
+
+Conflicts
+- A conflicted row cannot be edited or deleted on the device — allowing it re-queues the row against its stale base and restarts the conflict loop.
+  Mitigation: resolving the conflict makes the row editable again so the worker can delete it; a resolution itself deletes only when the losing push was a deletion (`submitted_deleted`).
+- `fileConflict`'s duplicate check ignores `submitted_deleted`, so an old build re-pushing the same payload as a deletion is folded into the earlier non-deletion conflict.
+- A worker who dismisses a resolution notice loses the only view they have of the earlier version; it survives in `record_conflicts`, readable by supervisors, not by them.
 
 ## Working style
 

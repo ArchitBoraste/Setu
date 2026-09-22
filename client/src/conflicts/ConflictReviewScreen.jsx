@@ -3,6 +3,7 @@ import { NetworkError, NotAuthenticatedError } from "../lib/api.js";
 import { differingFields, unionFields } from "../lib/payload.js";
 import { shortTime } from "../lib/time.js";
 import { FIELD_LABELS, showValue } from "../records/formFields.js";
+import CompareGrid from "../components/CompareGrid.jsx";
 import { listConflicts, resolveConflict } from "./conflictService.js";
 
 // Temporary review screen, matching the rest of the app: hardcoded form,
@@ -54,6 +55,20 @@ const styles = {
     background: tone === "warn" ? "#fffbeb" : "#f6f6f6",
   }),
   chosen: { outline: "2px solid #b45309" },
+  // Explicit colours, not the browser's button defaults. Under a dark colour
+  // scheme the default button text is light, and on the light tint marking a
+  // differing field the value became invisible — a supervisor choosing between
+  // two answers could not read either of them.
+  pick: { background: "#fff", color: "#111", border: "1px solid #ccc" },
+  confirm: {
+    marginTop: "0.75rem",
+    padding: "0.75rem 1rem",
+    border: "1px solid #b91c1c",
+    borderRadius: 4,
+    background: "#fef2f2",
+    fontSize: 14,
+  },
+  danger: { color: "#7f1d1d" },
 };
 
 // UUIDs are unreadable at full length and a supervisor only ever needs to tell
@@ -120,14 +135,148 @@ function VersionCompare({ conflict }) {
         );
       })}
 
-      {current.deletedAt && (
+      {(current.deletedAt || submitted.deleted) && (
         <Fragment>
+          {/* Either side being a deletion is a different decision from a
+              disagreement about answers, and it is the one a supervisor can
+              least afford to miss in a column of field values. */}
           <span style={styles.muted}>Deleted</span>
-          <span>{shortTime(current.deletedAt)}</span>
-          <span>—</span>
+          <span style={styles.differs}>
+            {current.deletedAt ? `yes, ${shortTime(current.deletedAt)}` : "no"}
+          </span>
+          <span style={styles.differs}>
+            {submitted.deleted ? "yes — this copy deletes the record" : "no"}
+          </span>
         </Fragment>
       )}
     </div>
+  );
+}
+
+/**
+ * What a kept_client or merged resolution will overwrite — shown BEFORE it does.
+ *
+ * Both overwrite the record's current answers, and until migration 002 those
+ * answers were then gone from everywhere. They are kept now, but "recoverable
+ * from an audit table" is not the same as "the supervisor saw it coming", and a
+ * mis-click between two adjacent buttons should cost a second look, not a trip
+ * to the database. So the supervisor is shown exactly what is about to be
+ * replaced: how many fields, which, and the values that will leave the record.
+ *
+ * kept_server needs none of this. It writes nothing, so it replaces nothing.
+ *
+ * Inline rather than window.confirm(), for the reasons RemoveAccountPanel gives:
+ * a browser dialog cannot show a table of values, and is dismissed by reflex.
+ */
+function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onBack }) {
+  const { current, submitted } = conflict;
+  const replaced = [...differingFields(current.payload, result)];
+  const only = (payload) =>
+    Object.fromEntries(replaced.map((field) => [field, payload?.[field] ?? null]));
+
+  // Mirrors conflictRules.js exactly. kept_client deletes only on a recorded
+  // deletion; nothing un-deletes; merges never change existence.
+  const deletes = resolution === "kept_client" && submitted.deleted && !current.deletedAt;
+  const staysDeleted = Boolean(current.deletedAt);
+
+  const count = replaced.length;
+  const fieldsPhrase = `${count} ${count === 1 ? "field" : "fields"}`;
+
+  return (
+    <div style={styles.confirm}>
+      <p style={{ margin: 0 }}>
+        <strong>
+          {resolution === "kept_client"
+            ? "Keep the worker's version?"
+            : "Save this merged version?"}
+        </strong>
+      </p>
+
+      {count === 0 ? (
+        <p>No answer on the record changes.</p>
+      ) : (
+        <>
+          <p>
+            <strong>{fieldsPhrase}</strong> will be replaced. The values in the
+            left column will be removed from the record:
+          </p>
+          <CompareGrid
+            leftLabel={`Removed (now in v${current.version})`}
+            rightLabel="Replaced with"
+            left={only(current.payload)}
+            right={only(result)}
+          />
+        </>
+      )}
+
+      {deletes && (
+        <p style={styles.danger}>
+          This also <strong>deletes the record</strong>: the worker&apos;s copy was a
+          deletion, and keeping it removes the household from the register.
+        </p>
+      )}
+
+      {staysDeleted && (
+        <p style={styles.muted}>
+          This record is already deleted on the server and stays deleted —
+          resolving a conflict never restores a record. Restore it separately if
+          that is what you mean.
+        </p>
+      )}
+
+      <p style={styles.muted}>
+        The replaced version is kept with this conflict and stays readable in the
+        Resolved tab.
+      </p>
+
+      <p style={{ marginBottom: 0 }}>
+        <button onClick={onConfirm} disabled={busy}>
+          {deletes
+            ? "Keep the worker's version and delete the record"
+            : count === 0
+              ? "Confirm"
+              : `Replace ${fieldsPhrase}`}
+        </button>{" "}
+        <button onClick={onBack} disabled={busy}>
+          Go back
+        </button>
+      </p>
+    </div>
+  );
+}
+
+/**
+ * On a resolved conflict: what the decision replaced.
+ *
+ * Without this the Resolved tab shows the losing copy beside the record as it
+ * stands NOW — which, after a kept_client, are the same thing, and the version
+ * that was actually overwritten is nowhere on screen. An audit view that hides
+ * the one thing a decision destroyed is worse than none.
+ */
+function ReplacedByDecision({ conflict }) {
+  if (conflict.resolution === "kept_server") return null;
+
+  if (!conflict.superseded) {
+    // Resolved before migration 002. Said plainly rather than rendered as an
+    // empty comparison, which would read as "nothing was replaced".
+    return (
+      <p style={styles.muted}>
+        The version this decision replaced was not kept — it was resolved before
+        replaced versions were recorded, and that content cannot be recovered.
+      </p>
+    );
+  }
+
+  return (
+    <>
+      <p style={styles.muted}>This decision replaced version v{conflict.superseded.version}:</p>
+      <CompareGrid
+        leftLabel={`Replaced (v${conflict.superseded.version})`}
+        rightLabel={`Now (v${conflict.current.version})`}
+        left={conflict.superseded.payload}
+        right={conflict.current.payload}
+      />
+    </>
   );
 }
 
@@ -140,7 +289,11 @@ function VersionCompare({ conflict }) {
  * other, because they are real answers from a real household and the server
  * stores them.
  */
-function MergeEditor({ conflict, onCancel, onSubmit, busy }) {
+function MergeEditor({ conflict, onCancel, onSubmit, busy, locked }) {
+  // `locked` while the replacement preview is open. The preview describes the
+  // picks as they were when Save was pressed; letting them change underneath it
+  // would have the supervisor confirm one merge and send another.
+  const frozen = busy || locked;
   const { current, submitted } = conflict;
   const fields = unionFields(current.payload, submitted.payload);
   const differs = differingFields(current.payload, submitted.payload);
@@ -178,15 +331,17 @@ function MergeEditor({ conflict, onCancel, onSubmit, busy }) {
               <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
               <button
                 type="button"
-                style={{ ...tint, ...(pick === "server" ? styles.chosen : {}) }}
+                style={{ ...styles.pick, ...tint, ...(pick === "server" ? styles.chosen : {}) }}
                 onClick={() => setPicks((p) => ({ ...p, [field]: "server" }))}
+                disabled={frozen}
               >
                 {showValue(current.payload?.[field] ?? null)}
               </button>
               <button
                 type="button"
-                style={{ ...tint, ...(pick === "worker" ? styles.chosen : {}) }}
+                style={{ ...styles.pick, ...tint, ...(pick === "worker" ? styles.chosen : {}) }}
                 onClick={() => setPicks((p) => ({ ...p, [field]: "worker" }))}
+                disabled={frozen}
               >
                 {showValue(submitted.payload?.[field] ?? null)}
               </button>
@@ -195,20 +350,28 @@ function MergeEditor({ conflict, onCancel, onSubmit, busy }) {
         })}
       </div>
 
-      <p>
-        <button onClick={() => onSubmit(build())} disabled={busy}>
-          Save merged version
-        </button>{" "}
-        <button onClick={onCancel} disabled={busy}>
-          Cancel
-        </button>
-      </p>
+      {!locked && (
+        <p>
+          <button onClick={() => onSubmit(build())} disabled={busy}>
+            Save merged version
+          </button>{" "}
+          <button onClick={onCancel} disabled={busy}>
+            Cancel
+          </button>
+        </p>
+      )}
     </div>
   );
 }
 
 function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMerge }) {
   const open = conflict.status === "open";
+  // A resolution that overwrites the record, waiting on the supervisor to see
+  // what it replaces: { resolution, payload }. kept_server never lands here.
+  const [pending, setPending] = useState(null);
+
+  const confirmPending = () =>
+    onResolve(conflict, pending.resolution, pending.payload);
 
   return (
     <li style={styles.card}>
@@ -233,12 +396,19 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
 
       <VersionCompare conflict={conflict} />
 
-      {open && !merging && (
+      {!open && <ReplacedByDecision conflict={conflict} />}
+
+      {open && !merging && !pending && (
         <p>
+          {/* Straight through: kept_server writes nothing, so there is nothing
+              to preview and nothing it could replace. */}
           <button onClick={() => onResolve(conflict, "kept_server")} disabled={busy}>
             Keep the server&apos;s version
           </button>{" "}
-          <button onClick={() => onResolve(conflict, "kept_client")} disabled={busy}>
+          <button
+            onClick={() => setPending({ resolution: "kept_client", payload: undefined })}
+            disabled={busy}
+          >
             Keep the worker&apos;s version
           </button>{" "}
           <button onClick={() => onMerge(conflict)} disabled={busy}>
@@ -251,8 +421,22 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
         <MergeEditor
           conflict={conflict}
           busy={busy}
+          locked={pending !== null}
           onCancel={onCancelMerge}
-          onSubmit={(payload) => onResolve(conflict, "merged", payload)}
+          onSubmit={(payload) => setPending({ resolution: "merged", payload })}
+        />
+      )}
+
+      {open && pending && (
+        <ReplacementPreview
+          conflict={conflict}
+          resolution={pending.resolution}
+          // What the record's answers will be afterwards: the worker's copy
+          // whole, or the supervisor's assembled merge.
+          result={pending.payload ?? conflict.submitted.payload}
+          busy={busy}
+          onConfirm={confirmPending}
+          onBack={() => setPending(null)}
         />
       )}
     </li>
@@ -331,9 +515,11 @@ export default function ConflictReviewScreen() {
       const answer = await resolveConflict(conflict.id, resolution, payload);
       setMergingId(null);
       setResult(
-        answer.recordChanged
-          ? `Saved. The record is now version ${answer.version} and will reach every device on their next sync.`
-          : "Saved. The record was already right, so nothing was rewritten."
+        answer.recordDeleted
+          ? `Saved. The record is deleted (version ${answer.version}), and the version it replaced is kept with the conflict.`
+          : answer.recordChanged
+            ? `Saved. The record is now version ${answer.version} and will reach every device on their next sync. The version it replaced is kept with the conflict.`
+            : "Saved. The record was already right, so nothing was rewritten."
       );
       setReloadToken((token) => token + 1);
     } catch (err) {

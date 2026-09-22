@@ -46,18 +46,48 @@ export const RESOLVE_ERROR = {
 };
 
 /**
+ * The record's content immediately before a resolution overwrites it.
+ *
+ * Written into record_conflicts.superseded_* in the same transaction as the
+ * overwrite. Without it the version a resolution replaces exists nowhere:
+ * `records` keeps no history, every device holding that version is synced and
+ * overwrites its own copy on the next pull, and record_conflicts.payload holds
+ * the OTHER side — the push that lost. That is how a supervisor's single click
+ * used to destroy a worker's accepted answers with no copy left anywhere.
+ *
+ * Form identity travels with the payload because kept_client adopts the losing
+ * copy's form revision, so the replaced answers may belong to a different one.
+ */
+function snapshotOf(record) {
+  return {
+    version: record.version,
+    formType: record.formType,
+    formVersion: record.formVersion,
+    payload: record.payload,
+    payloadText: JSON.stringify(record.payload),
+  };
+}
+
+/**
  * What a resolution does to `records`, decided before anything is written.
  *
- * Returns { value: { resolution, write } } where `write` is null when the record
- * is not to be touched, or the exact columns to set when it is. The version and
- * timestamp rules are the push route's, not new ones: version + 1, and an
- * explicitly written updated_at, so a resolved record travels to other devices
- * through the ordinary delta window like any other change.
+ * Returns { value: { resolution, write, superseded } }:
+ *
+ *   write       null when the record is not to be touched, or the exact columns
+ *               to set when it is. The version and timestamp rules are the push
+ *               route's, not new ones: version + 1, and an explicitly written
+ *               updated_at, so a resolved record travels to other devices
+ *               through the ordinary delta window like any other change.
+ *               `write.deletes` is true when the record must become a tombstone.
+ *
+ *   superseded  what the record held before `write` replaces it, to be kept in
+ *               record_conflicts. Null exactly when `write` is null: nothing
+ *               replaced, nothing to keep.
  *
  * @param {object} args
  * @param {string} args.resolution     kept_server | kept_client | merged
- * @param {object} args.conflict       { formType, formVersion, payload }
- * @param {object} args.record         { formType, formVersion, version }
+ * @param {object} args.conflict       { formType, formVersion, payload, submittedDeleted }
+ * @param {object} args.record         { formType, formVersion, payload, version }
  * @param {object} args.mergedPayload  the supervisor's assembled payload, for merged
  */
 export function planResolution({ resolution, conflict, record, mergedPayload }) {
@@ -83,7 +113,7 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
     // wait forever for news that structurally cannot arrive. That device learns
     // about it from GET /api/sync/resolutions instead, which is keyed on the
     // conflict's own lifecycle rather than the record's.
-    return { value: { resolution, write: null } };
+    return { value: { resolution, write: null, superseded: null } };
   }
 
   if (resolution === RESOLUTION.KEPT_CLIENT) {
@@ -98,6 +128,11 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
     // today's rules would let a later tightening make an already-collected
     // household visit permanently unchoosable — the supervisor would be blocked
     // from picking the only other copy that exists.
+    //
+    // And the losing copy's EXISTENCE comes with it, one way only. "Keep the
+    // worker's version" means the whole of what the worker sent — and if what
+    // they sent was a deletion, the household leaves the register. See the note
+    // at the foot of this file for why a 0 here never un-deletes anything.
     return {
       value: {
         resolution,
@@ -107,7 +142,9 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
           payload: conflict.payload,
           payloadText: JSON.stringify(conflict.payload),
           version: record.version + 1,
+          deletes: Boolean(conflict.submittedDeleted),
         },
+        superseded: snapshotOf(record),
       },
     };
   }
@@ -137,23 +174,47 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
         payload: payload.value.payload,
         payloadText: payload.value.payloadText,
         version: record.version + 1,
+        // A merge decides answers, field by field. Whether the household stays
+        // in the register is not a field, and a supervisor assembling a payload
+        // has not been asked about it — so a merge leaves existence alone.
+        deletes: false,
       },
+      superseded: snapshotOf(record),
     },
   };
 }
 
 // ---------------------------------------------------------------------------
-// WHAT A RESOLUTION DELIBERATELY DOES NOT DECIDE: whether the record exists.
+// WHEN A RESOLUTION DECIDES WHETHER THE RECORD EXISTS — AND WHEN IT DOES NOT.
 //
-// deleted_at is never touched here. record_conflicts stores the losing payload,
-// its form identity and its versions — but not the `deleted` flag the push
-// carried, so the server genuinely does not know whether the copy that lost was
-// an edit or a deletion. A resolution that moved deleted_at would therefore be
-// guessing at a worker's intent, and guessing wrong either resurrects a
-// household that withdrew consent or destroys a visit that happened.
+// Until migration 002 a resolution never touched deleted_at, because the server
+// did not know whether the copy that lost was an edit or a deletion: filing a
+// conflict dropped the push's `deleted` flag. A resolution that moved the
+// tombstone would have been guessing at a worker's intent.
 //
-// So a resolution decides CONTENT and nothing else, and the tombstone survives
-// it unchanged, exactly as it does through a re-push. A supervisor who needs to
-// delete or undelete does it as an ordinary write afterwards, where the act is
-// explicit and attributable on its own.
+// record_conflicts.submitted_deleted now records it, so kept_client can honour
+// it — in ONE direction:
+//
+//   submitted_deleted = 1   the worker's push was a deletion, and the
+//                           supervisor chose the worker's version. The record
+//                           becomes a tombstone. If it already was one, it keeps
+//                           the moment it was first raised, the same rule the
+//                           push route applies, so a device that applied the
+//                           earlier deletion does not see it as a newer event.
+//
+//   submitted_deleted = 0   deleted_at is left EXACTLY as it is. Never cleared.
+//
+// The asymmetry is deliberate. Every conflict filed before 002 carries 0, and on
+// those rows 0 means "never recorded", not "was an edit". Treating 0 as "the
+// worker's version is live, so undelete" would resurrect a household on the
+// strength of a column default — the one outcome here that can put a family
+// that withdrew consent back into the register. An unknown must be able to do
+// nothing, and only a recorded 1 is allowed to act.
+//
+// The cost: kept_client against a record the SERVER had deleted leaves it
+// deleted, even when the worker's copy was a live edit. The review screen says
+// so before the supervisor confirms, and restoring a record stays what it was
+// before — an ordinary, explicit write afterwards, attributable on its own.
+//
+// Merges and kept_server never change existence, for the reasons beside them.
 // ---------------------------------------------------------------------------

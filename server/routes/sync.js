@@ -133,8 +133,9 @@ async function fileConflict(conn, actor, stored, incoming) {
   await conn.query(
     `INSERT INTO record_conflicts
        (id, record_id, organization_id, submitted_by, device_id,
-        base_version, server_version, form_type, form_version, payload)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))`,
+        base_version, server_version, form_type, form_version, payload,
+        submitted_deleted)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?)`,
     [
       conflictId,
       stored.id,
@@ -149,6 +150,12 @@ async function fileConflict(conn, actor, stored, incoming) {
       incoming.formType,
       incoming.formVersion,
       incoming.payloadText,
+      // Whether the losing push was a deletion. The payload alone cannot say —
+      // a deleted row still carries its last answers — and without this a
+      // supervisor keeping "the worker's version" would adopt the answers and
+      // quietly drop the decision to remove the household. validateEnvelope has
+      // already required `deleted` to be a real boolean.
+      incoming.deleted ? 1 : 0,
     ]
   );
   return conflictId;
@@ -609,9 +616,14 @@ const RESOLUTION_COLUMNS = `
   rc.form_type       AS submittedFormType,
   rc.form_version    AS submittedFormVersion,
   rc.payload         AS submittedPayload,
+  rc.submitted_deleted AS submittedDeleted,
   rc.submitted_by    AS submittedById,
   ru.full_name       AS resolvedByName,
   DATE_FORMAT(rc.resolved_at, '${SERVER_TIME_FORMAT}') AS resolvedAt,
+  rc.superseded_version      AS supersededVersion,
+  rc.superseded_form_type    AS supersededFormType,
+  rc.superseded_form_version AS supersededFormVersion,
+  rc.superseded_payload      AS supersededPayload,
   r.created_by   AS createdBy,
   r.device_id    AS deviceId,
   r.form_type    AS formType,
@@ -657,12 +669,38 @@ function toResolutionView(row) {
     // own copy of it.
     submitted: {
       payload: row.submittedPayload,
+      deleted: row.submittedDeleted === 1,
       formType: row.submittedFormType,
       formVersion: row.submittedFormVersion,
       baseVersion: row.baseVersion,
       collidedWithVersion: row.collidedWithVersion,
       byId: row.submittedById,
     },
+
+    // What the record said immediately before this resolution replaced it.
+    //
+    // This is the copy that used to be destroyed. It belonged to whoever wrote
+    // the version the supervisor overrode — for a field worker's record, almost
+    // always the worker who captured it, because mayWrite() lets no other field
+    // worker's phone push it; only a supervisor's can. By the time this reaches
+    // their device, the record pull earlier in the same sync has already
+    // overwritten their local copy, so the device cannot keep it itself; the
+    // server has to hand it back.
+    //
+    // It travels under the scope this feed already has — conflicts you raised,
+    // or about records you captured — and no wider. A device with no stake in
+    // the record never receives a resolution for it, so it never receives the
+    // replaced answers either. Null for kept_server, and for resolutions made
+    // before migration 002, whose replaced version was not kept.
+    superseded:
+      row.supersededPayload === null
+        ? null
+        : {
+            payload: row.supersededPayload,
+            version: row.supersededVersion,
+            formType: row.supersededFormType,
+            formVersion: row.supersededFormVersion,
+          },
 
     // Shaped exactly like a pulled record, so the device applies it through the
     // same path a pull uses rather than a second, parallel one that can drift.

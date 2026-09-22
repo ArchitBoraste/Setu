@@ -122,6 +122,13 @@ CREATE TABLE records (
 --
 -- Nothing here is ever deleted on resolution. A rejected household visit is
 -- collected data; losing a version compare is not a reason to destroy it.
+--
+-- And nothing a resolution REPLACES is destroyed either. `payload` is the copy
+-- that lost the push; `superseded_*` is the copy the record held immediately
+-- before a resolution overwrote it. Between them, both sides of every decision
+-- survive the decision. See migrations/002_preserve_superseded.sql for why the
+-- second half was added late, and why conflicts resolved before it cannot be
+-- recovered.
 -- ============================================================
 CREATE TABLE record_conflicts (
   id              CHAR(36)     NOT NULL,
@@ -134,10 +141,20 @@ CREATE TABLE record_conflicts (
   form_type       VARCHAR(64)  NOT NULL,
   form_version    INT          NOT NULL DEFAULT 1,
   payload         JSON         NOT NULL,          -- the rejected copy, verbatim
+  -- Whether the rejected push was a deletion. 0 on rows filed before 002 means
+  -- unknown, which is why a resolution only ever acts on 1.
+  submitted_deleted TINYINT(1) NOT NULL DEFAULT 0,
   status          ENUM('open','resolved') NOT NULL DEFAULT 'open',
   resolution      ENUM('kept_server','kept_client','merged') NULL,
   resolved_by     CHAR(36)     NULL,
   resolved_at     DATETIME(3)  NULL,
+  -- The record as it stood immediately before a resolution replaced it. NULL
+  -- for kept_server (nothing replaced), for open conflicts, and for anything
+  -- resolved before 002 — that content was overwritten with no copy kept.
+  superseded_version      INT         NULL,
+  superseded_form_type    VARCHAR(64) NULL,
+  superseded_form_version INT         NULL,
+  superseded_payload      JSON        NULL,
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   -- The supervisor's queue: open conflicts in one organisation, oldest first.

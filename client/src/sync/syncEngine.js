@@ -496,6 +496,25 @@ async function applyPulledPage(user, records, summary) {
  * was adopted would be its own kind of wrong.
  */
 function toResolutionNotice(user, resolution, discarded) {
+  // What the record said on the SERVER immediately before the decision replaced
+  // it — as opposed to `discarded`, which is what THIS PHONE was holding.
+  //
+  // The two differ, and the difference is the whole reason this is carried. On
+  // the phone of the worker who captured the record, the record pull earlier in
+  // this same sync has already overwritten the local copy with the new version,
+  // so by the time this runs there is nothing left on the device to snapshot.
+  // Their answers — the ones a supervisor just overrode — come back only
+  // because the server kept them (record_conflicts.superseded_payload).
+  //
+  // Kept only when it tells the worker something: not when it matches what the
+  // record says now, and not when it would repeat the discarded copy shown
+  // beside it.
+  const superseded = resolution.superseded ?? null;
+  const showSuperseded =
+    superseded !== null &&
+    !samePayload(superseded.payload, resolution.record.payload) &&
+    !(discarded && samePayload(discarded.payload, superseded.payload));
+
   return {
     conflictId: resolution.conflictId,
     resolution: resolution.resolution,
@@ -510,6 +529,8 @@ function toResolutionNotice(user, resolution, discarded) {
     submittedByMe: resolution.submitted?.byId === user.userId,
     discardedPayload: discarded ? discarded.payload : null,
     discardedVersion: discarded ? discarded.version : null,
+    supersededPayload: showSuperseded ? superseded.payload : null,
+    supersededVersion: showSuperseded ? superseded.version : null,
     // Device clock, and only ever used to order notices on screen.
     noticedAt: Date.now(),
   };

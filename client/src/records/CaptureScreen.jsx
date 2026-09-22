@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   SYNC_STATE,
   countPendingRecords,
@@ -15,9 +15,8 @@ import {
   runSync,
   startSyncOnReconnect,
 } from "../sync/syncEngine.js";
-import { differingFields, unionFields } from "../lib/payload.js";
 import { shortTime } from "../lib/time.js";
-import { FIELD_LABELS, showValue } from "./formFields.js";
+import CompareGrid from "../components/CompareGrid.jsx";
 
 // Temporary capture screen. The form is hardcoded so there is real data to sync
 // in the next step; the dynamic form builder replaces it later.
@@ -74,8 +73,8 @@ const EMPTY_FORM = {
   notes: "",
 };
 
-// FIELD_LABELS and showValue now live in ./formFields.js, shared with the
-// supervisor's conflict screen.
+// Field labels live in ./formFields.js and the side-by-side diff in
+// ../components/CompareGrid.jsx, both shared with the supervisor's screen.
 
 const BADGE_COLOURS = {
   [SYNC_STATE.SYNCED]: "seagreen",
@@ -113,18 +112,6 @@ const styles = {
     border: `1px solid ${tone === "warn" ? "#b45309" : "#ccc"}`,
     background: tone === "warn" ? "#fffbeb" : "#f6f6f6",
   }),
-  compare: {
-    display: "grid",
-    gridTemplateColumns: "10rem 1fr 1fr",
-    gap: "0.25rem 0.75rem",
-    fontSize: 13,
-    marginTop: "0.5rem",
-    padding: "0.5rem",
-    background: "#fafafa",
-    border: "1px solid #eee",
-  },
-  compareHead: { fontWeight: 600 },
-  differs: { background: "#fff1f2" },
   resolved: {
     padding: "0.5rem 0.75rem",
     borderRadius: 4,
@@ -218,48 +205,6 @@ function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
 }
 
 /**
- * Two payloads side by side, with the fields that actually differ tinted.
- *
- * Shared by the conflict view and the resolution notice, because they ask the
- * same question of a worker — "what is different between these two?" — and
- * answering it two slightly different ways is how two answers start to disagree.
- * The tinting is not decoration: nobody diffs twenty identical fields by eye,
- * and a worker who cannot find the disagreement will assume their visit was
- * lost.
- */
-function CompareGrid({ leftLabel, rightLabel, left, right, extraRows = [] }) {
-  const fields = unionFields(left, right);
-  const differs = differingFields(left, right);
-
-  return (
-    <div style={styles.compare}>
-      <span style={styles.compareHead} />
-      <span style={styles.compareHead}>{leftLabel}</span>
-      <span style={styles.compareHead}>{rightLabel}</span>
-
-      {fields.map((field) => {
-        const tint = differs.has(field) ? styles.differs : undefined;
-        return (
-          <Fragment key={field}>
-            <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
-            <span style={tint}>{showValue(left?.[field] ?? null)}</span>
-            <span style={tint}>{showValue(right?.[field] ?? null)}</span>
-          </Fragment>
-        );
-      })}
-
-      {extraRows.map(([label, a, b]) => (
-        <Fragment key={label}>
-          <span style={styles.muted}>{label}</span>
-          <span>{a}</span>
-          <span>{b}</span>
-        </Fragment>
-      ))}
-    </div>
-  );
-}
-
-/**
  * Both copies of a conflicted record, side by side and read-only.
  *
  * Read-only is now literal: while this is on screen the row cannot be edited at
@@ -331,6 +276,10 @@ function ResolutionNotice({ record, onDismiss, busy }) {
   if (!notice) return null;
 
   const discarded = notice.discardedPayload;
+  // Absent on notices written before this field existed, which is why it is
+  // read with ?? rather than assumed.
+  const superseded = notice.supersededPayload ?? null;
+  const keepsSomething = Boolean(discarded || superseded);
 
   return (
     <div style={styles.resolved}>
@@ -341,10 +290,42 @@ function ResolutionNotice({ record, onDismiss, busy }) {
       </span>
 
       <p style={{ margin: "0.5rem 0 0" }}>
-        This record now reads as version {record.version}
-        {record.deletedAt ? ", and has been deleted" : ""}. It is back in sync and
-        you can edit it again.
+        {record.deletedAt ? (
+          // Said outright, not folded into a version number. A record that a
+          // decision DELETED is the case where "it now reads as v4" is the least
+          // useful sentence available.
+          <>
+            This record has been <strong>deleted</strong> (version {record.version}).
+            It stays on this list until you dismiss this notice.
+          </>
+        ) : (
+          <>
+            This record now reads as version {record.version}. It is back in sync
+            and you can edit it again.
+          </>
+        )}
       </p>
+
+      {superseded && (
+        <>
+          <p style={{ margin: "0.5rem 0 0" }}>
+            {/* This is the case that used to end in silence: the worker who
+                captured the record, holding no unsent work, watches it become
+                something else. Their earlier answers were already overwritten on
+                this phone by the ordinary pull — this copy came back from the
+                server, which now keeps it with the decision. */}
+            Before this decision the record read as below (v{notice.supersededVersion}).
+            That version was <strong>replaced</strong>. It is kept on the server
+            with the record of this decision.
+          </p>
+          <CompareGrid
+            leftLabel={`Before (v${notice.supersededVersion})`}
+            rightLabel={`Now (v${record.version})`}
+            left={superseded}
+            right={record.payload}
+          />
+        </>
+      )}
 
       {discarded ? (
         <>
@@ -366,9 +347,10 @@ function ResolutionNotice({ record, onDismiss, busy }) {
       ) : (
         <p style={{ margin: "0.5rem 0 0" }}>
           {/* Carefully narrower than "nothing changed", which would be false:
-              the record itself may well read differently now, and the line above
-              says so. What is true in every no-discard case is that this phone
-              was not holding anything unsent that the decision threw away. */}
+              the record itself may well read differently now, and the lines
+              above say so. What is true in every no-discard case is that this
+              phone was not holding anything unsent that the decision threw
+              away. */}
           Nothing you had captured but not yet sent was discarded by this
           decision.
         </p>
@@ -376,7 +358,9 @@ function ResolutionNotice({ record, onDismiss, busy }) {
 
       <p style={{ margin: "0.5rem 0 0" }}>
         <button onClick={() => onDismiss(record)} disabled={busy}>
-          {discarded ? "Dismiss (removes the copy above from this phone)" : "Dismiss"}
+          {keepsSomething
+            ? "Dismiss (removes the earlier version above from this phone)"
+            : "Dismiss"}
         </button>
       </p>
     </div>
@@ -711,11 +695,12 @@ export default function CaptureScreen() {
   // never deletes — and the wording says exactly that rather than implying a
   // destruction that is not happening, or a safety that is not there.
   const handleDismissNotice = (record) => {
-    const discarded = record.resolvedNotice?.discardedPayload;
+    const notice = record.resolvedNotice;
+    const keepsSomething = Boolean(notice?.discardedPayload || notice?.supersededPayload);
     if (
-      discarded &&
+      keepsSomething &&
       !window.confirm(
-        "This removes your replaced copy of these answers from this phone. " +
+        "This removes the earlier version of these answers from this phone. " +
           "It stays on the server with the record of the supervisor's decision. Dismiss?"
       )
     ) {

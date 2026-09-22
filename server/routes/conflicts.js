@@ -43,6 +43,7 @@ const CONFLICT_COLUMNS = `
   rc.form_type       AS submittedFormType,
   rc.form_version    AS submittedFormVersion,
   rc.payload         AS submittedPayload,
+  rc.submitted_deleted AS submittedDeleted,
   rc.submitted_by    AS submittedById,
   su.full_name       AS submittedByName,
   rc.device_id       AS submittedDeviceId,
@@ -50,6 +51,10 @@ const CONFLICT_COLUMNS = `
   ru.full_name       AS resolvedByName,
   DATE_FORMAT(rc.created_at,  '${SERVER_TIME_FORMAT}') AS createdAt,
   DATE_FORMAT(rc.resolved_at, '${SERVER_TIME_FORMAT}') AS resolvedAt,
+  rc.superseded_version      AS supersededVersion,
+  rc.superseded_form_type    AS supersededFormType,
+  rc.superseded_form_version AS supersededFormVersion,
+  rc.superseded_payload      AS supersededPayload,
   r.form_type        AS currentFormType,
   r.form_version     AS currentFormVersion,
   r.payload          AS currentPayload,
@@ -110,6 +115,11 @@ function toConflictView(row) {
     // naming it "received" keeps the screen from claiming one it does not have.
     submitted: {
       payload: row.submittedPayload,
+      // The losing push was a deletion. The screen has to say so before a
+      // supervisor keeps this copy, because keeping it now deletes the record.
+      // On conflicts filed before migration 002 this is false for want of a
+      // record, not because the push was known to be an edit.
+      deleted: row.submittedDeleted === 1,
       formType: row.submittedFormType,
       formVersion: row.submittedFormVersion,
       baseVersion: row.baseVersion,
@@ -119,6 +129,21 @@ function toConflictView(row) {
       deviceId: row.submittedDeviceId,
       receivedAt: row.createdAt,
     },
+
+    // What the resolution replaced, for kept_client and merged. Null for open
+    // conflicts, for kept_server (nothing replaced), and for anything resolved
+    // before migration 002 — whose replaced version was overwritten with no copy
+    // kept, and is gone. `resolution` beside it is what lets the screen tell the
+    // last case apart from the other two.
+    superseded:
+      row.supersededPayload === null
+        ? null
+        : {
+            payload: row.supersededPayload,
+            version: row.supersededVersion,
+            formType: row.supersededFormType,
+            formVersion: row.supersededFormVersion,
+          },
 
     // The record as it stands now.
     current: {
@@ -259,8 +284,13 @@ router.post(
       await conn.beginTransaction();
       try {
         const [[record]] = await conn.query(
+          // payload and form identity are read here, under the lock, because
+          // they are what gets kept in superseded_* — the snapshot has to be the
+          // exact content this transaction overwrites, not a copy read before
+          // someone else's push could land in between.
           `SELECT id, organization_id AS organizationId, form_type AS formType,
-                  form_version AS formVersion, payload, version
+                  form_version AS formVersion, payload, version,
+                  DATE_FORMAT(deleted_at, '${SERVER_TIME_FORMAT}') AS deletedAt
              FROM records WHERE id = ? FOR UPDATE`,
           [peek.recordId]
         );
@@ -278,7 +308,8 @@ router.post(
         // here, and the second one reads the status the first committed.
         const [[conflict]] = await conn.query(
           `SELECT id, record_id AS recordId, status, form_type AS formType,
-                  form_version AS formVersion, payload
+                  form_version AS formVersion, payload,
+                  submitted_deleted AS submittedDeleted
              FROM record_conflicts WHERE id = ? FOR UPDATE`,
           [id]
         );
@@ -347,12 +378,17 @@ router.post(
             //                 read as its own echo, and overwriting a
             //                 supervisor's judgement with nothing raised.
             //
-            //   deleted_at    untouched, deliberately. See the closing note in
-            //                 conflictRules.js — a resolution decides content,
-            //                 never whether the household exists.
+            //   deleted_at    set only when write.deletes — kept_client on a
+            //                 conflict whose losing push was a deletion. An
+            //                 existing tombstone keeps the moment it was first
+            //                 raised, the push route's rule. Otherwise the stored
+            //                 value is written back unchanged, read under this
+            //                 same lock: a resolution never clears a tombstone.
+            //                 See the closing note in conflictRules.js for why
+            //                 that is one-directional.
             `UPDATE records
                 SET form_type = ?, form_version = ?, payload = CAST(? AS JSON),
-                    version = ?, device_id = ?, updated_at = ?
+                    version = ?, device_id = ?, updated_at = ?, deleted_at = ?
               WHERE id = ?`,
             [
               write.formType,
@@ -361,20 +397,44 @@ router.post(
               write.version,
               RESOLVED_DEVICE_ID,
               serverNow,
+              write.deletes ? (record.deletedAt ?? serverNow) : record.deletedAt,
               record.id,
             ]
           );
         }
 
+        // What the decision replaced. Null for kept_server, which wrote
+        // nothing; otherwise the record exactly as it was locked above.
+        const superseded = plan.value.superseded;
+
         const [result] = await conn.query(
           // AND status = 'open' as well as the locked re-read above. The lock is
           // what makes it correct; this is what makes it correct even if someone
           // later moves the read.
+          //
+          // The superseded snapshot is written in the SAME transaction as the
+          // overwrite of `records`. If either fails, neither happens — there is
+          // no instant at which the old version is gone from the record and not
+          // yet kept here.
           `UPDATE record_conflicts
               SET status = 'resolved', resolution = ?, resolved_by = ?,
-                  resolved_at = ?
+                  resolved_at = ?,
+                  superseded_version = ?, superseded_form_type = ?,
+                  superseded_form_version = ?,
+                  superseded_payload = CAST(? AS JSON)
             WHERE id = ? AND status = 'open'`,
-          [plan.value.resolution, req.user.id, serverNow, id]
+          [
+            plan.value.resolution,
+            req.user.id,
+            serverNow,
+            superseded?.version ?? null,
+            superseded?.formType ?? null,
+            superseded?.formVersion ?? null,
+            // CAST(NULL AS JSON) is NULL, so kept_server stores a real NULL
+            // rather than the JSON literal null.
+            superseded?.payloadText ?? null,
+            id,
+          ]
         );
 
         if (result.affectedRows !== 1) {
@@ -400,6 +460,10 @@ router.post(
           recordId: record.id,
           version: write ? write.version : record.version,
           recordChanged: Boolean(write),
+          // Only true when this resolution turned a live record into a
+          // tombstone, so the screen can say so rather than report a version.
+          recordDeleted: Boolean(write?.deletes) && record.deletedAt === null,
+          previousVersionKept: superseded !== null,
         });
       } catch (error) {
         await conn.rollback();

@@ -8,6 +8,7 @@ import {
 import UpdatePrompt from "./components/UpdatePrompt.jsx";
 import CaptureScreen from "./records/CaptureScreen.jsx";
 import RemoveAccountPanel from "./records/RemoveAccountPanel.jsx";
+import ConflictReviewScreen from "./conflicts/ConflictReviewScreen.jsx";
 import { DATABASE_OUTDATED_EVENT } from "./db/index.js";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
@@ -86,6 +87,12 @@ function LoginForm({ onSubmit, busy }) {
   );
 }
 
+// One React bundle serves field workers, supervisors and admins, so the role
+// decides what is DRAWN and nothing more. Every route the conflict screen calls
+// re-checks the role from the verified JWT: a field worker who reached this
+// component anyway would see an empty list and be refused on every action.
+const CAN_REVIEW_CONFLICTS = new Set(["supervisor", "admin"]);
+
 function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
   return (
     <div>
@@ -104,6 +111,8 @@ function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
       </button>
 
       <CaptureScreen />
+
+      {CAN_REVIEW_CONFLICTS.has(user.role) && <ConflictReviewScreen />}
 
       <RemoveAccountPanel onRemove={onRemove} busy={busy} />
     </div>

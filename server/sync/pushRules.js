@@ -21,6 +21,31 @@ export const MAX_STRING_LENGTH = 10_000;
 export const MAX_FORM_TYPE_LENGTH = 64; // matches records.form_type VARCHAR(64)
 export const MAX_FORM_VERSION = 10_000;
 
+// ---------------------------------------------------------------------------
+// The device_id stamped on a version written by a CONFLICT RESOLUTION.
+//
+// records.device_id is not decoration. It is the discriminator the idempotency
+// rule below turns on: "a device still sending base = N has never been told
+// N+1, so if that same device is named as the author of N+1, its own earlier
+// push landed and the response was lost." That premise holds for every version
+// a push writes, because only a push can advance a version — until now.
+//
+// A resolution breaks it. The supervisor writes N+1 from the server, and the
+// device that authored N is never told. Left with its own id on the row, that
+// device — which is SYNCED, not conflicted, and perfectly free to keep editing
+// — would push base = N, be read as its own echo, and ACCEPT: a supervisor's
+// decision about someone's data silently overwritten, no conflict raised, no
+// trace. That is the worst outcome this step can produce, so the row says
+// plainly that no device wrote it.
+//
+// The nil UUID is safe as that marker because it cannot collide with a real
+// device: every id getDeviceId() mints is a v4 UUID, which always carries a 4
+// in the version nibble. It is nonetheless REFUSED on the wire by
+// validateEnvelope, because it matches the UUID shape and a client claiming it
+// would walk straight back into the echo path it exists to close.
+// ---------------------------------------------------------------------------
+export const RESOLVED_DEVICE_ID = "00000000-0000-0000-0000-000000000000";
+
 export const PUSH_OUTCOME = {
   INSERT: "insert",
   ACCEPT: "accept",
@@ -292,6 +317,13 @@ export function validateEnvelope(item) {
   if (typeof item.deviceId !== "string" || !UUID_RE.test(item.deviceId)) {
     return fail("deviceId must be a UUID");
   }
+  // The nil UUID matches the shape above, so it has to be refused by name. It
+  // marks a version written by a conflict resolution, and a push claiming it
+  // would be read as the echo of a write no device made — which is exactly the
+  // overwrite RESOLVED_DEVICE_ID exists to prevent.
+  if (item.deviceId === RESOLVED_DEVICE_ID) {
+    return fail("deviceId is reserved");
+  }
   if (typeof item.formType !== "string" || !FORM_TYPE_RE.test(item.formType)) {
     return fail(
       `formType must match [a-z0-9_] and be at most ${MAX_FORM_TYPE_LENGTH} characters`
@@ -441,7 +473,15 @@ export function classifyPush(baseVersion, stored, incoming) {
   }
 
   // base < stored.version — see the idempotency note above.
-  if (stored.deviceId === incoming.deviceId) {
+  //
+  // The echo rule does not apply to a version a SUPERVISOR wrote. Such a version
+  // carries RESOLVED_DEVICE_ID precisely so this branch cannot claim it, because
+  // "the only way this device is named as the author of a version it was never
+  // told about is its own lost response" is false when the author was a person
+  // resolving a conflict on the server. Falling through to CONFLICT is the
+  // conservative answer: a human already decided this row once, and a device
+  // that never saw that decision does not get to undo it unseen.
+  if (stored.deviceId !== RESOLVED_DEVICE_ID && stored.deviceId === incoming.deviceId) {
     if (sameContent(stored, incoming)) {
       return { outcome: PUSH_OUTCOME.REPLAY, version: stored.version };
     }

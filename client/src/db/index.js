@@ -1,4 +1,5 @@
 import Dexie from "dexie";
+import { toServerTimeString } from "../lib/time.js";
 
 export const db = new Dexie("setu");
 
@@ -56,6 +57,33 @@ db.version(3).upgrade((tx) =>
       row.formVersion ??= 1;
       // No rejected server copy waiting to be compared.
       row.serverConflict ??= null;
+    })
+);
+
+// Version 4 adds fields and normalises one, so like v3 it inherits v2's stores
+// and only runs an upgrade. v2 and v3 are left exactly as they shipped.
+db.version(4).upgrade((tx) =>
+  tx
+    .table("records")
+    .toCollection()
+    .modify((row) => {
+      // No supervisor decision has landed on this row.
+      row.resolvedNotice ??= null;
+
+      // THE MIXED-TYPE FIX.
+      //
+      // deletedAt held a device-clock NUMBER when the delete was made here and a
+      // server date STRING when the row arrived through a pull. Both are on
+      // phones in the field right now, in the same column, and a comparison
+      // across the two does not throw — it coerces the string to NaN and returns
+      // false for `>`, `<` and `===` alike. Every device is converted once, on
+      // upgrade, so nothing downstream ever has to ask which kind it is holding.
+      //
+      // `??=` is deliberately not used: a live row's deletedAt is an explicit
+      // null and must stay one, and only the numbers need converting.
+      if (typeof row.deletedAt === "number") {
+        row.deletedAt = toServerTimeString(row.deletedAt);
+      }
     })
 );
 

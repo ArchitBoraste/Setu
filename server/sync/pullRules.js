@@ -55,6 +55,22 @@ function isServerTime(value) {
 }
 
 /**
+ * Capped, not refused. A device asking for too much gets a smaller page and
+ * another round trip, which is strictly better than an error it cannot act on —
+ * and the cap is what stops one request loading an organisation's entire
+ * history, payloads and all, into memory.
+ */
+function parsePageSize(limit) {
+  if (limit === undefined) return { value: DEFAULT_PULL_LIMIT };
+
+  const parsed = Number(limit);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    return { error: "limit must be a positive integer" };
+  }
+  return { value: Math.min(parsed, MAX_PULL_LIMIT) };
+}
+
+/**
  * Settles the closed interval this request covers.
  *
  * `requestedUntil` is the upper bound the client was given on the FIRST page of
@@ -118,18 +134,9 @@ export function validatePullQuery(query) {
     }
   }
 
-  let pageSize = DEFAULT_PULL_LIMIT;
-  if (limit !== undefined) {
-    const parsed = Number(limit);
-    if (!Number.isInteger(parsed) || parsed < 1) {
-      return fail("limit must be a positive integer");
-    }
-    // Capped, not refused. A device asking for too much gets a smaller page and
-    // another round trip, which is strictly better than an error it cannot act
-    // on — and the cap is what stops one request loading an organisation's
-    // entire history, payloads and all, into memory.
-    pageSize = Math.min(parsed, MAX_PULL_LIMIT);
-  }
+  const page = parsePageSize(limit);
+  if (page.error) return fail(page.error);
+  const pageSize = page.value;
 
   return {
     value: {
@@ -138,6 +145,56 @@ export function validatePullQuery(query) {
       afterUpdatedAt: hasAfter ? afterUpdatedAt : null,
       afterId: hasAfter ? afterId : null,
       pageSize,
+    },
+  };
+}
+
+/**
+ * The same window, asked of GET /api/sync/resolutions.
+ *
+ * Deliberately the same shape as validatePullQuery — one closed interval, one
+ * keyset, one page size — because a device runs both halves inside ONE sync and
+ * stores ONE cursor for the pair. The only difference is which column the keyset
+ * names: resolutions are ordered by record_conflicts.resolved_at, records by
+ * records.updated_at, and mixing the two parameter names up would silently page
+ * one feed with the other's position.
+ *
+ * Both columns are written from the same NOW(3) inside the resolve
+ * transaction, so a resolution and the record write it caused land on the same
+ * side of any window edge. A device never sees one without the other.
+ */
+export function validateResolutionQuery(query) {
+  const fail = (message) => ({ error: message });
+
+  const { since, until, afterResolvedAt, afterId, limit } = query ?? {};
+
+  if (since !== undefined && !isServerTime(since)) {
+    return fail("since must be a server timestamp previously returned by /pull");
+  }
+  if (until !== undefined && !isServerTime(until)) {
+    return fail("until must be a server timestamp previously returned by /pull");
+  }
+
+  const hasAfter = afterResolvedAt !== undefined || afterId !== undefined;
+  if (hasAfter) {
+    if (!isServerTime(afterResolvedAt)) {
+      return fail("afterResolvedAt must be a server timestamp");
+    }
+    if (typeof afterId !== "string" || !UUID_RE.test(afterId)) {
+      return fail("afterId must be a UUID");
+    }
+  }
+
+  const page = parsePageSize(limit);
+  if (page.error) return fail(page.error);
+
+  return {
+    value: {
+      since: since ?? EPOCH_CURSOR,
+      requestedUntil: until ?? null,
+      afterResolvedAt: hasAfter ? afterResolvedAt : null,
+      afterId: hasAfter ? afterId : null,
+      pageSize: page.value,
     },
   };
 }

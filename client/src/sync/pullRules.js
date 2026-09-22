@@ -101,9 +101,17 @@ export function classifyPulledRow(local, remote) {
 
   if (local.syncState === SYNC_STATE.CONFLICT) {
     // Refresh what the comparison view shows beside the worker's copy, so they
-    // are not reading a server version that has since moved on. Resolving is
-    // step 12's job and is deliberately not done here — and the local payload,
-    // version and syncedVersion are all left exactly as they are.
+    // are not reading a server version that has since moved on — and resolve
+    // NOTHING. The local payload, version and syncedVersion are all left exactly
+    // as they are.
+    //
+    // A resolved record arriving here still takes this branch, and that is
+    // correct. The record alone cannot say whether the disagreement was settled:
+    // a kept_server resolution writes nothing to the record at all, so "the
+    // version moved" and "a person decided" are different facts and only one of
+    // them travels on this feed. Leaving conflict state is driven by
+    // classifyResolution() below, off the conflict's own lifecycle, and the
+    // resolution is applied after this page so it has the last word.
     return { action: PULL_ACTION.REFRESH_CONFLICT };
   }
 
@@ -119,4 +127,80 @@ export function classifyPulledRow(local, remote) {
   }
 
   return { action: PULL_ACTION.OVERWRITE };
+}
+
+// ---------------------------------------------------------------------------
+// THE DEADLOCK EXIT
+//
+// A conflicted row is frozen on purpose. Its syncedVersion is never advanced —
+// not by push, which never accepted it, and not by pull, which deliberately
+// leaves it alone above — so its base stays permanently stale; and CONFLICT is
+// not PENDING, so the push queue cannot pick it up. Those two facts together are
+// what stop the row colliding with itself forever, and they are also what make
+// the state permanent without something to end it.
+//
+// A resolution is that something. It is the ONLY thing that may advance
+// syncedVersion on a conflicted row, because it is the only event that means
+// "the two copies are no longer in dispute" — a person looked at both and said
+// which one stands.
+// ---------------------------------------------------------------------------
+
+export const RESOLUTION_ACTION = {
+  // The row is in conflict and the dispute is over: take the server's copy
+  // whole, advance syncedVersion to the server's version, and rejoin normal
+  // operation.
+  ADOPT: "adopt",
+  // Tell the worker what was decided, and change not one byte of the record.
+  NOTIFY: "notify",
+  // Nothing on this device to update.
+  SKIP: "skip",
+};
+
+/**
+ * Takes the LOCAL row and nothing else, deliberately.
+ *
+ * Which way the supervisor decided does not appear here, and must not: whether
+ * this device may overwrite what it is holding is a question about this device's
+ * unsent work, not about the verdict. A rule that read the resolution could be
+ * talked into adopting over a pending row by the right value arriving in a
+ * response, and the row it would overwrite is a household visit that exists on
+ * one phone.
+ *
+ * @param {object|null} local  the Dexie row, or null
+ */
+export function classifyResolution(local) {
+  // A resolution for a record this device does not hold. It may have been
+  // wiped, or belong to another worker on a shared phone. The record itself
+  // arrives through the ordinary pull if it is in scope; there is nothing here
+  // to reconcile.
+  if (!local) return { action: RESOLUTION_ACTION.SKIP };
+
+  if (local.syncState === SYNC_STATE.CONFLICT) {
+    // The row this whole mechanism exists for.
+    return { action: RESOLUTION_ACTION.ADOPT };
+  }
+
+  // NOT in conflict — and the record is emphatically not touched here.
+  //
+  // Two ways to arrive:
+  //
+  //   PENDING or REJECTED  this device holds work the server has not accepted.
+  //                        Adopting would overwrite a household visit that
+  //                        exists on exactly one phone, in exactly one row, to
+  //                        settle a dispute this row is not part of. The
+  //                        ordinary push/pull machinery already handles it: the
+  //                        next push carries its stale base and the SERVER
+  //                        decides, which is right, because the server is the
+  //                        only party holding both copies.
+  //
+  //   SYNCED               this device agrees with the server, so there is
+  //                        nothing to adopt — the new version arrives through
+  //                        the normal record pull in this same window. But the
+  //                        worker is told anyway, and that is the point of this
+  //                        branch: when a supervisor keeps another device's copy
+  //                        or merges one, the record changes under the worker
+  //                        who captured it. A record silently becoming something
+  //                        else, on the phone of the person who walked to that
+  //                        household, is not acceptable.
+  return { action: RESOLUTION_ACTION.NOTIFY };
 }

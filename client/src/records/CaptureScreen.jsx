@@ -4,6 +4,7 @@ import {
   countPendingRecords,
   countUnsyncedOnDevice,
   createRecord,
+  dismissResolutionNotice,
   listRecords,
   softDeleteRecord,
   updateRecord,
@@ -14,6 +15,9 @@ import {
   runSync,
   startSyncOnReconnect,
 } from "../sync/syncEngine.js";
+import { differingFields, unionFields } from "../lib/payload.js";
+import { shortTime } from "../lib/time.js";
+import { FIELD_LABELS, showValue } from "./formFields.js";
 
 // Temporary capture screen. The form is hardcoded so there is real data to sync
 // in the next step; the dynamic form builder replaces it later.
@@ -70,14 +74,8 @@ const EMPTY_FORM = {
   notes: "",
 };
 
-const FIELD_LABELS = {
-  householdName: "Household name",
-  memberCount: "Members",
-  childrenUnderFive: "Children under five",
-  visitDate: "Visit date",
-  waterSource: "Water source",
-  notes: "Notes",
-};
+// FIELD_LABELS and showValue now live in ./formFields.js, shared with the
+// supervisor's conflict screen.
 
 const BADGE_COLOURS = {
   [SYNC_STATE.SYNCED]: "seagreen",
@@ -127,6 +125,14 @@ const styles = {
   },
   compareHead: { fontWeight: 600 },
   differs: { background: "#fff1f2" },
+  resolved: {
+    padding: "0.5rem 0.75rem",
+    borderRadius: 4,
+    fontSize: 14,
+    border: "1px solid #0369a1",
+    background: "#f0f9ff",
+    marginTop: "0.5rem",
+  },
 };
 
 // Reads only; the caller decides what to do with the result. Keeping state out
@@ -147,10 +153,6 @@ function summarise(record) {
   return [householdName || "(no name)", visitDate, `${memberCount ?? "?"} members`]
     .filter(Boolean)
     .join(" · ");
-}
-
-function showValue(value) {
-  return value === null || value === undefined || value === "" ? "—" : String(value);
 }
 
 function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
@@ -216,51 +218,172 @@ function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
 }
 
 /**
+ * Two payloads side by side, with the fields that actually differ tinted.
+ *
+ * Shared by the conflict view and the resolution notice, because they ask the
+ * same question of a worker — "what is different between these two?" — and
+ * answering it two slightly different ways is how two answers start to disagree.
+ * The tinting is not decoration: nobody diffs twenty identical fields by eye,
+ * and a worker who cannot find the disagreement will assume their visit was
+ * lost.
+ */
+function CompareGrid({ leftLabel, rightLabel, left, right, extraRows = [] }) {
+  const fields = unionFields(left, right);
+  const differs = differingFields(left, right);
+
+  return (
+    <div style={styles.compare}>
+      <span style={styles.compareHead} />
+      <span style={styles.compareHead}>{leftLabel}</span>
+      <span style={styles.compareHead}>{rightLabel}</span>
+
+      {fields.map((field) => {
+        const tint = differs.has(field) ? styles.differs : undefined;
+        return (
+          <Fragment key={field}>
+            <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
+            <span style={tint}>{showValue(left?.[field] ?? null)}</span>
+            <span style={tint}>{showValue(right?.[field] ?? null)}</span>
+          </Fragment>
+        );
+      })}
+
+      {extraRows.map(([label, a, b]) => (
+        <Fragment key={label}>
+          <span style={styles.muted}>{label}</span>
+          <span>{a}</span>
+          <span>{b}</span>
+        </Fragment>
+      ))}
+    </div>
+  );
+}
+
+/**
  * Both copies of a conflicted record, side by side and read-only.
  *
- * There is no resolve action here — that is step 12. What a worker must never
- * have is a red badge with nothing behind it: "conflict" means nothing to
- * somebody who cannot see what the two sides actually disagree about, and a
- * worker who cannot see it will assume their visit was lost. Differing fields
- * are tinted so the disagreement is findable without reading every row.
+ * Read-only is now literal: while this is on screen the row cannot be edited at
+ * all (see assertEditable in recordService.js). What a worker must never have is
+ * a red badge with nothing behind it — "conflict" means nothing to somebody who
+ * cannot see what the two sides actually disagree about.
  */
 function ConflictCompare({ record }) {
   const server = record.serverConflict;
   if (!server) return null;
 
-  const fields = [...new Set([...Object.keys(record.payload), ...Object.keys(server.payload ?? {})])];
+  return (
+    <CompareGrid
+      leftLabel={`On this device (v${record.version})`}
+      rightLabel={`On the server (v${server.version})`}
+      left={record.payload}
+      right={server.payload}
+      extraRows={[
+        ["Deleted", record.deletedAt ? "yes" : "no", server.deletedAt ? "yes" : "no"],
+        ["Server saved", "—", shortTime(server.updatedAt) ?? "—"],
+      ]}
+    />
+  );
+}
+
+// What each decision actually did to THIS worker's record, in the second person.
+// "kept_client" is not a phrase anybody has to decode: the point of the sentence
+// is that a person looked at both versions and chose, and which one they chose.
+//
+// Split by whether this worker is the one whose copy was under judgement,
+// because the same decision is opposite news for the two of them. A resolution
+// also reaches the worker who CAPTURED the record without having pushed the
+// losing copy — "a supervisor kept your version" would simply be untrue to them,
+// and a notice that tells somebody something they know to be wrong is a notice
+// they stop reading.
+function resolutionHeadline({ resolution, submittedByMe }) {
+  if (resolution === "merged") {
+    return "A supervisor combined both versions of this record, field by field.";
+  }
+  if (resolution === "kept_client") {
+    return submittedByMe
+      ? "A supervisor kept your version of this record."
+      : "A supervisor replaced this record with another worker's version.";
+  }
+  if (resolution === "kept_server") {
+    return submittedByMe
+      ? "A supervisor kept the version that was already on the server, not yours."
+      : "A supervisor kept this record as it was.";
+  }
+  return "A supervisor resolved a disagreement about this record.";
+}
+
+/**
+ * What happened to a record while it was in dispute.
+ *
+ * A worker whose copy lost has to be able to see three things, and this is the
+ * only place any of them appear: that a supervisor changed the record, what the
+ * current version now says, and — when their own answers were the ones dropped —
+ * what those answers were.
+ *
+ * The last one is why this is not a toast. A record silently becoming something
+ * else on the phone of the person who walked to that household is exactly the
+ * harm this project exists to prevent, and a notice that disappears on its own
+ * is barely different from no notice at all. It stays until the worker dismisses
+ * it, and dismissing says what is being given up.
+ */
+function ResolutionNotice({ record, onDismiss, busy }) {
+  const notice = record.resolvedNotice;
+  if (!notice) return null;
+
+  const discarded = notice.discardedPayload;
 
   return (
-    <div style={styles.compare}>
-      <span style={styles.compareHead} />
-      <span style={styles.compareHead}>On this device (v{record.version})</span>
-      <span style={styles.compareHead}>On the server (v{server.version})</span>
+    <div style={styles.resolved}>
+      <strong>{resolutionHeadline(notice)}</strong>{" "}
+      <span style={styles.muted}>
+        {notice.resolvedByName ? `${notice.resolvedByName}, ` : ""}
+        {shortTime(notice.resolvedAt) ?? "recently"} (server time)
+      </span>
 
-      {fields.map((field) => {
-        const mine = record.payload?.[field] ?? null;
-        const theirs = server.payload?.[field] ?? null;
-        const differs = mine !== theirs;
-        return (
-          <Fragment key={field}>
-            <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
-            <span style={differs ? styles.differs : undefined}>{showValue(mine)}</span>
-            <span style={differs ? styles.differs : undefined}>{showValue(theirs)}</span>
-          </Fragment>
-        );
-      })}
+      <p style={{ margin: "0.5rem 0 0" }}>
+        This record now reads as version {record.version}
+        {record.deletedAt ? ", and has been deleted" : ""}. It is back in sync and
+        you can edit it again.
+      </p>
 
-      <span style={styles.muted}>Deleted</span>
-      <span>{record.deletedAt ? "yes" : "no"}</span>
-      <span>{server.deletedAt ? "yes" : "no"}</span>
+      {discarded ? (
+        <>
+          <p style={{ margin: "0.5rem 0 0" }}>
+            {/* Named explicitly. "Your copy was replaced" is the fact a worker
+                needs; burying it under a neutral "the record was updated" is how
+                somebody finds out a week later that their visit is gone. */}
+            Your copy of these answers (v{notice.discardedVersion}) was{" "}
+            <strong>replaced</strong>. It is shown below, and the copy you sent is
+            also kept on the server with the record of this decision.
+          </p>
+          <CompareGrid
+            leftLabel={`Your copy (v${notice.discardedVersion})`}
+            rightLabel={`Now (v${record.version})`}
+            left={discarded}
+            right={record.payload}
+          />
+        </>
+      ) : (
+        <p style={{ margin: "0.5rem 0 0" }}>
+          {/* Carefully narrower than "nothing changed", which would be false:
+              the record itself may well read differently now, and the line above
+              says so. What is true in every no-discard case is that this phone
+              was not holding anything unsent that the decision threw away. */}
+          Nothing you had captured but not yet sent was discarded by this
+          decision.
+        </p>
+      )}
 
-      <span style={styles.muted}>Server saved</span>
-      <span>—</span>
-      <span>{server.updatedAt ?? "—"}</span>
+      <p style={{ margin: "0.5rem 0 0" }}>
+        <button onClick={() => onDismiss(record)} disabled={busy}>
+          {discarded ? "Dismiss (removes the copy above from this phone)" : "Dismiss"}
+        </button>
+      </p>
     </div>
   );
 }
 
-function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
+function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onToggle }) {
   const isConflict = record.syncState === SYNC_STATE.CONFLICT;
   const isRejected = record.syncState === SYNC_STATE.REJECTED;
   // The server's copy is a tombstone while this device still holds the row.
@@ -302,6 +425,8 @@ function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
 
       {isConflict && expanded && <ConflictCompare record={record} />}
 
+      <ResolutionNotice record={record} onDismiss={onDismiss} busy={busy} />
+
       {isRejected && (
         <p style={styles.muted}>
           {/* Server messages are fragments, not sentences, so the full stop is
@@ -311,29 +436,39 @@ function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
         </p>
       )}
 
-      <button onClick={() => onEdit(record)} disabled={busy}>
+      {/* Disabled, not hidden, and with the reason beside them. A conflicted
+          row is read-only until somebody resolves it — recordService refuses the
+          write regardless of what this renders — and a button that silently
+          stops working teaches a worker that the app is broken. Saying why also
+          says that the record is not lost and that somebody is expected to act.
+          The rule itself is in assertEditable(): editing here would put the row
+          back to PENDING, push it against the same stale base, and conflict
+          again, forever. */}
+      <button onClick={() => onEdit(record)} disabled={busy || isConflict}>
         Edit
       </button>{" "}
-      <button onClick={() => onDelete(record)} disabled={busy}>
+      <button onClick={() => onDelete(record)} disabled={busy || isConflict}>
         Delete
       </button>
+      {isConflict && (
+        <span style={styles.muted}>
+          {" "}
+          · locked until this is resolved
+        </span>
+      )}
     </li>
   );
 }
 
 /**
- * The server's own timestamp, shown as the server wrote it.
- *
- * Deliberately sliced rather than passed through new Date(). The string carries
- * no timezone, so reparsing it would read it in the phone's zone — and a phone
- * with a wrong clock or a changed region setting would then display a confident,
- * wrong time for an event that happened on another machine. Sync stopped
- * depending on this device's clock; the label should not quietly put it back.
+ * The server's own timestamp, shown as the server wrote it — sliced by
+ * shortTime(), never passed through new Date(). See lib/time.js for why
+ * reparsing it would make a phone display a confident, wrong time for something
+ * that happened on another machine.
  */
 function lastSyncedLabel(serverSyncedAt) {
   if (!serverSyncedAt) return "Never synced";
-  // "2026-09-22 15:16:21.934000" -> "2026-09-22 15:16"
-  return `Last synced ${serverSyncedAt.slice(0, 16)} (server time)`;
+  return `Last synced ${shortTime(serverSyncedAt)} (server time)`;
 }
 
 /**
@@ -410,6 +545,17 @@ function SyncNotice({ summary }) {
   }
   if (summary.pullConflicts) parts.push(`${summary.pullConflicts} needs review`);
   if (summary.heldBack) parts.push(`${summary.heldBack} kept local`);
+
+  // Counted apart from "received" and "updated". A record leaving conflict
+  // because a person decided about it is not the same event as a record
+  // arriving, and a worker who has been unable to edit a row for days is owed a
+  // line that says so rather than one more number in a row of them.
+  if (summary.resolutionsApplied) {
+    parts.push(`${summary.resolutionsApplied} conflict resolved`);
+  }
+  if (summary.resolutionsNoticed) {
+    parts.push(`${summary.resolutionsNoticed} changed by a supervisor`);
+  }
 
   if (parts.length === 0) {
     // A sync that pushed nothing and received nothing still reached the server,
@@ -559,6 +705,25 @@ export default function CaptureScreen() {
     setForm(EMPTY_FORM);
   };
 
+  // Confirmed, because on a kept_server resolution this is the last copy of the
+  // worker's own answers ON THIS PHONE. It is not the last copy anywhere — the
+  // pushed payload stays in record_conflicts on the server, which resolution
+  // never deletes — and the wording says exactly that rather than implying a
+  // destruction that is not happening, or a safety that is not there.
+  const handleDismissNotice = (record) => {
+    const discarded = record.resolvedNotice?.discardedPayload;
+    if (
+      discarded &&
+      !window.confirm(
+        "This removes your replaced copy of these answers from this phone. " +
+          "It stays on the server with the record of the supervisor's decision. Dismiss?"
+      )
+    ) {
+      return;
+    }
+    return run(() => dismissResolutionNotice(record.id));
+  };
+
   const toggleExpanded = (id) => setExpandedId((current) => (current === id ? null : id));
 
   return (
@@ -599,6 +764,7 @@ export default function CaptureScreen() {
               record={record}
               onEdit={handleEdit}
               onDelete={handleDelete}
+              onDismiss={handleDismissNotice}
               busy={busy}
               expanded={expandedId === record.id}
               onToggle={toggleExpanded}

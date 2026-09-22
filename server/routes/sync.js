@@ -16,7 +16,9 @@ import {
   keysetFrom,
   resolveWindow,
   validatePullQuery,
+  validateResolutionQuery,
 } from "../sync/pullRules.js";
+import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
 
 const router = express.Router();
 
@@ -32,16 +34,9 @@ const router = express.Router();
 // client's to keep, in runSync(), because only the client knows a sync is one
 // thing rather than two requests.
 
-// Timestamps leave here as text in MySQL's own DATETIME format, produced by the
-// server's clock and never parsed by a device.
-//
-// The device stores the value and sends it back as the delta cursor in step 11,
-// so what matters is that it round-trips through MySQL unchanged. Handing back a
-// JS Date instead would put it through the driver's timezone conversion in both
-// directions, and a cursor that shifts by an offset either skips records or
-// replays them forever. %f prints microseconds, which for a DATETIME(3) column
-// is always three digits followed by three zeros — exact, not rounded.
-const SERVER_TIME_FORMAT = "%Y-%m-%d %H:%i:%s.%f";
+// SERVER_TIME_FORMAT now lives in ../sync/serverTime.js, because the conflict
+// routes hand back the same timestamps and two copies of the format string is
+// two things to keep in step.
 
 // Columns of the server's copy, aliased to camelCase for the API. Never
 // SELECT *: password_hash is one join away and payloads are large.
@@ -237,6 +232,10 @@ async function applyOne(conn, actor, incoming) {
         status: PUSH_STATUS.ACCEPTED,
         version: stored.version,
         serverUpdatedAt: stored.updatedAt,
+        // See the note beside deletedAt on the accept below: the device holds a
+        // provisional, device-clock tombstone date until the server answers with
+        // the real one, and a replay is an answer like any other.
+        deletedAt: stored.deletedAt,
         replayed: true,
       };
     }
@@ -247,6 +246,12 @@ async function applyOne(conn, actor, incoming) {
     const [[{ serverNow }]] = await conn.query(
       `SELECT DATE_FORMAT(NOW(3), '${SERVER_TIME_FORMAT}') AS serverNow`
     );
+
+    // A tombstone keeps the time it was first raised. Re-pushing a deleted row
+    // must not move that instant, or a device pulling later sees the deletion as
+    // newer than the edit it already applied. `stored` is null on an insert, so
+    // a row that arrives already deleted is dated now.
+    const deletedAt = incoming.deleted ? (stored?.deletedAt ?? serverNow) : null;
 
     if (verdict.outcome === PUSH_OUTCOME.INSERT) {
       await conn.query(
@@ -267,15 +272,10 @@ async function applyOne(conn, actor, incoming) {
           verdict.version,
           serverNow,
           serverNow,
-          incoming.deleted ? serverNow : null,
+          deletedAt,
         ]
       );
     } else {
-      // A tombstone keeps the time it was first raised. Re-pushing a deleted row
-      // must not move that instant, or a device pulling later sees the deletion
-      // as newer than the edit it already applied.
-      const deletedAt = incoming.deleted ? (stored.deletedAt ?? serverNow) : null;
-
       await conn.query(
         // updated_at is set EXPLICITLY, and not left to the column's ON UPDATE
         // CURRENT_TIMESTAMP(3).
@@ -319,6 +319,15 @@ async function applyOne(conn, actor, incoming) {
       status: PUSH_STATUS.ACCEPTED,
       version: verdict.version,
       serverUpdatedAt: serverNow,
+      // Handed back so the device can stop dating its own tombstones.
+      //
+      // A local soft delete has to write SOME date before it can be sent, and
+      // the only clock it has is its own — which may be years off, and is in
+      // whatever zone the phone is set to, while this column is in the server's.
+      // Returning the authoritative value means that guess survives exactly
+      // until the first successful push and is then replaced, instead of staying
+      // on the device forever as the row's permanent answer.
+      deletedAt,
     };
   } catch (error) {
     await conn.rollback();
@@ -555,6 +564,173 @@ router.get(
       serverTime: until,
       hasMore,
       nextCursor: hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null,
+    });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// RESOLUTIONS — the deadlock exit
+//
+// A conflicted row is frozen. Its syncedVersion is never advanced by push or
+// pull, so its base stays permanently stale, and it is excluded from the push
+// queue so it cannot collide again. That is deliberate, and without a way out it
+// is permanent: those rows accumulate on a phone forever.
+//
+// The way out cannot be the record alone. A kept_server resolution writes
+// nothing to `records` — correctly, because nothing about the record changed —
+// so its updated_at does not move and the row falls into no future delta window.
+// The device would wait for news that structurally cannot arrive.
+//
+// So closure travels on the conflict's own lifecycle, which is the thing that
+// actually changed. This feed answers "which disagreements that concern me were
+// settled in this window", and it carries the record's CURRENT copy with each
+// one, so a device can rejoin normal operation from a single response whether or
+// not the record itself moved.
+//
+// SCOPE: conflicts this caller raised, plus conflicts about records this caller
+// captured. The first is the device waiting to be unstuck. The second is the
+// worker who walked to that household and whose record a supervisor has just
+// changed underneath them — a record that silently becomes something else is
+// exactly what this is here to prevent.
+//
+// That scope needs no role branch, unlike the pull above. A field worker can
+// only ever have submitted a conflict about their own record — mayWrite() on the
+// push path refuses anything else before fileConflict() is ever reached — so
+// both disjuncts collapse to "my own records" for them, and neither can widen
+// what a lost phone gives up.
+// ---------------------------------------------------------------------------
+
+const RESOLUTION_COLUMNS = `
+  rc.id              AS conflictId,
+  rc.record_id       AS recordId,
+  rc.resolution,
+  rc.base_version    AS baseVersion,
+  rc.server_version  AS collidedWithVersion,
+  rc.form_type       AS submittedFormType,
+  rc.form_version    AS submittedFormVersion,
+  rc.payload         AS submittedPayload,
+  rc.submitted_by    AS submittedById,
+  ru.full_name       AS resolvedByName,
+  DATE_FORMAT(rc.resolved_at, '${SERVER_TIME_FORMAT}') AS resolvedAt,
+  r.created_by   AS createdBy,
+  r.device_id    AS deviceId,
+  r.form_type    AS formType,
+  r.form_version AS formVersion,
+  r.payload,
+  r.version,
+  DATE_FORMAT(r.created_at, '${SERVER_TIME_FORMAT}') AS createdAt,
+  DATE_FORMAT(r.updated_at, '${SERVER_TIME_FORMAT}') AS updatedAt,
+  DATE_FORMAT(r.deleted_at, '${SERVER_TIME_FORMAT}') AS deletedAt`;
+
+// The window and keyset are the pull's, on resolved_at instead of updated_at:
+// exclusive lower edge, inclusive upper edge so consecutive windows tile, and
+// (resolved_at, id) because one supervisor closing several conflicts in a
+// millisecond is ordinary, not exotic.
+const RESOLUTIONS_PAGE = `
+  SELECT ${RESOLUTION_COLUMNS}
+    FROM record_conflicts rc
+    JOIN records r ON r.id = rc.record_id
+    LEFT JOIN users ru ON ru.id = rc.resolved_by
+   WHERE rc.organization_id = ?
+     AND rc.status = 'resolved'
+     AND (rc.submitted_by = ? OR r.created_by = ?)
+     AND rc.resolved_at >  ?
+     AND rc.resolved_at <= ?
+     AND (rc.resolved_at > ? OR (rc.resolved_at = ? AND rc.id > ?))
+   ORDER BY rc.resolved_at ASC, rc.id ASC
+   LIMIT ?`;
+
+/** One settled disagreement, plus what the record says now. */
+function toResolutionView(row) {
+  return {
+    conflictId: row.conflictId,
+    recordId: row.recordId,
+    resolution: row.resolution,
+    resolvedAt: row.resolvedAt,
+    // May be null if the resolving account was later removed. A decision
+    // outlives the person who made it, and the row is still the audit trail.
+    resolvedByName: row.resolvedByName,
+
+    // The copy that was filed against this record, echoed back. For a
+    // kept_server resolution this is the only place that payload still exists
+    // outside record_conflicts itself, and the device is about to overwrite its
+    // own copy of it.
+    submitted: {
+      payload: row.submittedPayload,
+      formType: row.submittedFormType,
+      formVersion: row.submittedFormVersion,
+      baseVersion: row.baseVersion,
+      collidedWithVersion: row.collidedWithVersion,
+      byId: row.submittedById,
+    },
+
+    // Shaped exactly like a pulled record, so the device applies it through the
+    // same path a pull uses rather than a second, parallel one that can drift.
+    record: {
+      id: row.recordId,
+      createdBy: row.createdBy,
+      deviceId: row.deviceId,
+      formType: row.formType,
+      formVersion: row.formVersion,
+      payload: row.payload,
+      version: row.version,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      deletedAt: row.deletedAt,
+    },
+  };
+}
+
+router.get(
+  "/resolutions",
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const parsed = validateResolutionQuery(req.query);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+
+    const { since, requestedUntil, afterResolvedAt, afterId, pageSize } = parsed.value;
+
+    // Read before the rows are selected and held behind the clock, for the same
+    // reason the pull does it — see PULL_COMMIT_LAG_MS. A resolution commits
+    // some milliseconds after it stamps resolved_at, and a window edge taken
+    // from the raw clock would step over one that was still in flight, leaving a
+    // device stuck in conflict forever with nothing to show it.
+    const [[{ safeNow }]] = await pool.query(
+      `SELECT DATE_FORMAT(DATE_SUB(NOW(3), INTERVAL ? MICROSECOND), '${SERVER_TIME_FORMAT}') AS safeNow`,
+      [PULL_COMMIT_LAG_MS * 1000]
+    );
+
+    const { since: from, until } = resolveWindow(since, requestedUntil, safeNow);
+    // keysetFrom names the column afterUpdatedAt because the record pull is
+    // where it started; here the position it carries is a resolved_at.
+    const keyset = keysetFrom({
+      since: from,
+      afterUpdatedAt: afterResolvedAt,
+      afterId,
+    });
+
+    const [rows] = await pool.query(RESOLUTIONS_PAGE, [
+      req.user.organizationId,
+      req.user.id,
+      req.user.id,
+      from,
+      until,
+      keyset.updatedAt,
+      keyset.updatedAt,
+      keyset.id,
+      pageSize + 1,
+    ]);
+
+    const hasMore = rows.length > pageSize;
+    const page = hasMore ? rows.slice(0, pageSize) : rows;
+    const last = page[page.length - 1];
+
+    res.json({
+      resolutions: page.map(toResolutionView),
+      serverTime: until,
+      hasMore,
+      nextCursor:
+        hasMore && last ? { resolvedAt: last.resolvedAt, id: last.conflictId } : null,
     });
   })
 );

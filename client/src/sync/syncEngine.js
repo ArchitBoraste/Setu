@@ -5,8 +5,15 @@ import {
   NotAuthenticatedError,
   apiFetch,
 } from "../lib/api.js";
+import { getDeviceId } from "../lib/device.js";
+import { samePayload } from "../lib/payload.js";
 import { SYNC_STATE } from "../records/syncState.js";
-import { PULL_ACTION, classifyPulledRow } from "./pullRules.js";
+import {
+  PULL_ACTION,
+  RESOLUTION_ACTION,
+  classifyPulledRow,
+  classifyResolution,
+} from "./pullRules.js";
 
 // The only file in client/src that talks to the server about records. Capture
 // writes to IndexedDB and returns; this moves what is there to the server on its
@@ -17,6 +24,7 @@ import { PULL_ACTION, classifyPulledRow } from "./pullRules.js";
 
 const PUSH_PATH = "/api/sync/push";
 const PULL_PATH = "/api/sync/pull";
+const RESOLUTIONS_PATH = "/api/sync/resolutions";
 
 // Well under the server's 200 cap. Smaller batches finish inside the short
 // connectivity windows a field phone actually gets, and a dropped response costs
@@ -110,10 +118,23 @@ function backoffDelay(attempt) {
  * deleted is a boolean, not deletedAt, for the same reason: the device is
  * authoritative on WHETHER a row was deleted and never on WHEN.
  */
-function toWire(row) {
+function toWire(row, deviceId) {
   return {
     id: row.id,
-    deviceId: row.deviceId,
+    // THIS device, not row.deviceId.
+    //
+    // row.deviceId is the phone that AUTHORED the row, and a pull overwrites it
+    // with whatever device last wrote the server's copy. Sending that value made
+    // this device claim to be another one — and records.device_id is the
+    // discriminator the server's idempotency rule turns on. Phone B editing a
+    // record it pulled from phone A would push under A's id, and a stale base
+    // would then be read as A's own lost response and silently ACCEPTED: B's
+    // edit overwriting A's with no conflict raised and no trace that two people
+    // had disagreed.
+    //
+    // The field means "the phone this write came from", so it is answered by the
+    // phone the write is coming from.
+    deviceId,
     formType: row.formType,
     formVersion: row.formVersion,
     payload: row.payload,
@@ -212,6 +233,15 @@ async function applyResults(user, sentById, results, summary) {
           serverUpdatedAt: result.serverUpdatedAt,
           syncState: editedInFlight ? SYNC_STATE.PENDING : SYNC_STATE.SYNCED,
           syncError: null,
+          // The device's provisional tombstone date, replaced by the server's.
+          // A local delete has to write some date before it can be sent and the
+          // only clock it has is its own; this is the moment the authoritative
+          // value arrives. Guarded on the row still being deleted, because a
+          // worker may have changed it while the request was in the air, and on
+          // the server actually having sent one.
+          ...(row.deletedAt !== null && typeof result.deletedAt === "string"
+            ? { deletedAt: result.deletedAt }
+            : {}),
         });
         summary.accepted += 1;
         continue;
@@ -265,6 +295,9 @@ async function applyResults(user, sentById, results, summary) {
 
 async function pushPending(user, summary) {
   const seen = new Set();
+  // Read once for the whole push: it is one value per install, and asking per
+  // batch would open a Dexie transaction for something that cannot change.
+  const deviceId = await getDeviceId();
 
   for (;;) {
     const batch = await collectPendingBatch(user, seen);
@@ -273,7 +306,7 @@ async function pushPending(user, summary) {
     const sentById = new Map(batch.map((row) => [row.id, row]));
     summary.attempted += batch.length;
 
-    const response = await pushBatchWithRetry(batch.map(toWire));
+    const response = await pushBatchWithRetry(batch.map((row) => toWire(row, deviceId)));
     await applyResults(user, sentById, response.results ?? [], summary);
 
     // Marked seen whatever the answer was, including the rows that stayed
@@ -296,20 +329,11 @@ async function pushPending(user, summary) {
  * A pull is naturally idempotent — it reads a closed window and writes nothing
  * on the server — so an interrupted page can simply be asked for again.
  */
-async function pullPageWithRetry({ since, until, after, limit }) {
-  const params = new URLSearchParams();
-  if (since) params.set("since", since);
-  if (until) params.set("until", until);
-  if (after) {
-    params.set("afterUpdatedAt", after.updatedAt);
-    params.set("afterId", after.id);
-  }
-  params.set("limit", String(limit));
-
+async function getWithRetry(path, params) {
   let attempt = 0;
   for (;;) {
     try {
-      return await apiFetch(`${PULL_PATH}?${params.toString()}`);
+      return await apiFetch(`${path}?${params.toString()}`);
     } catch (error) {
       if (!(error instanceof NetworkError)) throw error;
 
@@ -318,6 +342,34 @@ async function pullPageWithRetry({ since, until, after, limit }) {
       await sleep(backoffDelay(attempt));
     }
   }
+}
+
+function windowParams({ since, until, limit }) {
+  const params = new URLSearchParams();
+  if (since) params.set("since", since);
+  if (until) params.set("until", until);
+  params.set("limit", String(limit));
+  return params;
+}
+
+function pullPageWithRetry({ since, until, after, limit }) {
+  const params = windowParams({ since, until, limit });
+  if (after) {
+    params.set("afterUpdatedAt", after.updatedAt);
+    params.set("afterId", after.id);
+  }
+  return getWithRetry(PULL_PATH, params);
+}
+
+// The keyset here is a position in resolved_at, not updated_at. Two feeds, two
+// parameter names, so one can never be paged with the other's cursor.
+function resolutionPageWithRetry({ since, until, after, limit }) {
+  const params = windowParams({ since, until, limit });
+  if (after) {
+    params.set("afterResolvedAt", after.resolvedAt);
+    params.set("afterId", after.id);
+  }
+  return getWithRetry(RESOLUTIONS_PATH, params);
 }
 
 /**
@@ -344,10 +396,16 @@ function toLocalRow(remote, organizationId, previous) {
     // The server has confirmed this version by definition: it just sent it.
     syncedVersion: remote.version,
     serverConflict: null,
-    // A tombstone carries the server's deletion time as a string, where a local
-    // delete writes a number. Nothing compares the two — deletedAt is only ever
-    // tested for null — and keeping the server's value means a pulled deletion
-    // is dated by the machine that actually made the decision.
+    // Carried across, because this is a whole-row put and every field not named
+    // here is dropped. A supervisor's decision is news the worker has not
+    // acknowledged yet; the next ordinary pull of the same record must not
+    // quietly take the explanation off their screen — least of all when the
+    // notice is holding the only local copy of the answers that were discarded.
+    resolvedNotice: previous?.resolvedNotice ?? null,
+    // The server's deletion time, stored unchanged. Both sides of deletedAt are
+    // the same representation now (see lib/time.js), so this is simply the
+    // authoritative value replacing whatever the device had guessed — dated by
+    // the machine that actually made the decision.
     deletedAt: remote.deletedAt,
     syncState: SYNC_STATE.SYNCED,
     syncError: null,
@@ -411,6 +469,129 @@ async function applyPulledPage(user, records, summary) {
 }
 
 /**
+ * What the worker is told, kept on the row itself.
+ *
+ * `discardedPayload` is the copy THIS DEVICE was holding when the resolution
+ * landed — the one the adopt below is about to overwrite.
+ *
+ * THE GUARANTEE, stated plainly, because a kept_server resolution destroys a
+ * worker's local answers and this is the only thing standing between that and a
+ * silent loss:
+ *
+ *   1. It is snapshotted HERE, before db.records.put() replaces the payload, in
+ *      the same Dexie transaction. There is no window in which the local copy is
+ *      gone and the notice does not yet hold it.
+ *   2. The row stays in the worker's list while the notice is set, even if the
+ *      resolution deleted it — listRecords() keeps any row carrying one — so the
+ *      copy is on screen, not merely in storage.
+ *   3. It survives the device entirely. The same payload is the row in
+ *      record_conflicts on the server, which resolution never deletes; that is
+ *      exactly why the conflict row outlives the decision. So even a phone that
+ *      is wiped, lost, or dismissed too fast has not taken the last copy with
+ *      it, and dismissResolutionNotice() says so before it asks.
+ *
+ * It is set only when the copy is actually being replaced by something
+ * different. On a kept_client resolution the worker's own copy is what WON, so
+ * there is nothing discarded, and telling them their data was dropped when it
+ * was adopted would be its own kind of wrong.
+ */
+function toResolutionNotice(user, resolution, discarded) {
+  return {
+    conflictId: resolution.conflictId,
+    resolution: resolution.resolution,
+    resolvedAt: resolution.resolvedAt,
+    resolvedByName: resolution.resolvedByName ?? null,
+    // Whether the copy under judgement was THIS user's push.
+    //
+    // The feed also reaches the worker who captured the record without having
+    // submitted anything, and the two need opposite sentences: "a supervisor
+    // kept your version" is false for the second, and telling somebody their
+    // data won when it was never in question is how a notice stops being read.
+    submittedByMe: resolution.submitted?.byId === user.userId,
+    discardedPayload: discarded ? discarded.payload : null,
+    discardedVersion: discarded ? discarded.version : null,
+    // Device clock, and only ever used to order notices on screen.
+    noticedAt: Date.now(),
+  };
+}
+
+/**
+ * Applies one page of resolutions, in one Dexie transaction.
+ *
+ * Runs AFTER the record pages of the same window, and that order is deliberate:
+ * a resolved record arriving in those pages hits REFRESH_CONFLICT, which only
+ * updates the server copy shown beside the worker's. This has the last word and
+ * is the one thing allowed to take a row out of conflict.
+ */
+async function applyResolutions(user, resolutions, summary) {
+  if (resolutions.length === 0) return;
+
+  await db.transaction("rw", db.records, async () => {
+    for (const resolution of resolutions) {
+      const local = await db.records.get(resolution.recordId);
+
+      // Re-read inside the transaction and re-checked, exactly as the push
+      // results are: the request took time, and the device may have changed
+      // hands during it.
+      if (local && local.createdBy !== user.userId) continue;
+
+      const { action } = classifyResolution(local ?? null);
+
+      if (action === RESOLUTION_ACTION.SKIP) continue;
+
+      if (action === RESOLUTION_ACTION.NOTIFY) {
+        // The record is NOT touched. Only the notice is written, so a row
+        // holding unsent work keeps it and a synced row is not churned.
+        await db.records.update(local.id, {
+          resolvedNotice: toResolutionNotice(user, resolution, null),
+        });
+        summary.resolutionsNoticed += 1;
+        continue;
+      }
+
+      // ADOPT. The dispute is settled, so the server's copy becomes this
+      // device's copy whole — payload, version, form identity and tombstone —
+      // and syncedVersion advances to the server's version. That last field is
+      // the entire point: it is the base the next push sends, and until it moves
+      // every push from this row arrives stale and conflicts again.
+      const replaced = !samePayload(local.payload, resolution.record.payload);
+
+      await db.records.put({
+        ...toLocalRow(resolution.record, user.organizationId, local),
+        resolvedNotice: toResolutionNotice(user, resolution, replaced ? local : null),
+      });
+      summary.resolutionsApplied += 1;
+    }
+  });
+}
+
+/**
+ * Walks the resolutions feed to the end of the SAME window the records pull
+ * used, so one sync reads one closed interval across both halves.
+ */
+async function pullResolutions(user, summary, { since, until }) {
+  let after = null;
+  let pages = 0;
+
+  for (;;) {
+    const page = await resolutionPageWithRetry({
+      since,
+      until,
+      after,
+      limit: PULL_PAGE_SIZE,
+    });
+
+    await applyResolutions(user, page.resolutions ?? [], summary);
+    pages += 1;
+
+    if (!page.hasMore || !page.nextCursor) break;
+    after = page.nextCursor;
+  }
+
+  summary.resolutionPages = pages;
+}
+
+/**
  * Walks the delta window to its end, then moves the cursor.
  *
  * The cursor is written ONCE, after the final page. Advancing it per page would
@@ -450,6 +631,20 @@ async function pullChanges(user, summary) {
 
   summary.pullPages = pages;
 
+  // The second half of the same window: which disagreements were settled in it.
+  //
+  // Inside pullChanges, and BEFORE the cursor moves, on purpose. If this threw
+  // after the cursor had advanced, every resolution in the window would fall
+  // below the next window's floor and never be offered again — and the rows they
+  // were about would stay frozen in conflict forever, with nothing anywhere
+  // recording that the exit had been missed. Leaving the cursor unmoved costs
+  // one re-read of a window the device has already applied, which is free:
+  // records re-arrive as SKIP, and a resolution re-applied to a row that has
+  // already left conflict is a NOTIFY that rewrites the same notice.
+  if (until) {
+    await pullResolutions(user, summary, { since, until });
+  }
+
   // Only now, and only forward. resolveWindow() already refuses to hand back an
   // edge below the cursor it was given, but a cursor that moves backwards
   // re-delivers rows the device has already applied, so the device checks too
@@ -481,6 +676,13 @@ function emptySummary() {
     heldBack: 0,
     pullConflicts: 0,
     pullPages: 0,
+    // Resolutions. `applied` are rows that LEFT conflict state and rejoined
+    // normal operation — the deadlock exit actually firing. `noticed` are rows
+    // that were not in conflict on this device and were only told what a
+    // supervisor decided.
+    resolutionsApplied: 0,
+    resolutionsNoticed: 0,
+    resolutionPages: 0,
     // The offline-login gap: tokens are null, so the server cannot be reached as
     // anybody. Not an error to show in red — an instruction.
     needsOnlineSignIn: false,

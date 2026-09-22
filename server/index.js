@@ -3,6 +3,7 @@ import cors from "cors";
 import { pool } from "./db/index.js";
 import authRoutes from "./routes/auth.js";
 import syncRoutes from "./routes/sync.js";
+import conflictRoutes from "./routes/conflicts.js";
 
 // Last-resort visibility. `node --watch` clears the terminal when it restarts
 // a crashed process, so without these a fatal error can scroll away before it
@@ -69,6 +70,10 @@ app.get("/api/db-health", async (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/sync", syncRoutes);
+// Mounted apart from /api/sync on purpose: these are a supervisor reviewing a
+// decision, not a device moving data, and unlike everything under /api/sync they
+// are online-only by design (see sync/conflictRules.js).
+app.use("/api/conflicts", conflictRoutes);
 
 // 404 handler — anything not matched above
 app.use((req, res) => {

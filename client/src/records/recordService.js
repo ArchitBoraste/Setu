@@ -13,6 +13,12 @@ export const SYNC_STATE = {
   SYNCED: "synced",
   // Both sides changed the row since the last sync. Needs a human or a rule.
   CONFLICT: "conflict",
+  // The server refused the row outright — a malformed payload, a version it
+  // never issued, a row belonging to someone else. Held apart from PENDING so
+  // the push queue, which selects only PENDING, can never pick it up again:
+  // nothing about resending an invalid record makes it valid. The reason lives
+  // in the row's syncError, and the row itself is never deleted.
+  REJECTED: "rejected",
 };
 
 /**
@@ -72,6 +78,11 @@ function stampLocalWrite(row, changes) {
     version: row.version + 1,
     localUpdatedAt: Date.now(),
     syncState: SYNC_STATE.PENDING,
+    // Editing is how a worker gets a rejected row moving again: it re-enters the
+    // push queue, and the old reason no longer describes what is about to be
+    // sent. serverConflict is deliberately NOT cleared — a worker editing a
+    // conflicted row is usually reading the server's copy while they do it.
+    syncError: null,
   };
 }
 
@@ -168,13 +179,25 @@ function currentUserRange(user, indexKey) {
  * The current user's live records, newest first. Soft-deleted rows are filtered
  * out here rather than by an index, because IndexedDB drops rows with a null key
  * from an index entirely.
+ *
+ * The exception is a deleted row the server would not take. Hiding those would
+ * leave a worker with a conflict or a rejection they are never shown and cannot
+ * act on, and a deletion that quietly failed is the one kind a supervisor most
+ * needs to hear about. A merely PENDING deletion stays hidden: it is ordinary
+ * unfinished work, and showing it back would read as the delete not having
+ * worked.
  */
 export async function listRecords() {
   const user = await requireUser();
 
   return currentUserRange(user, "[createdBy+localUpdatedAt]")
     .reverse()
-    .filter((row) => row.deletedAt === null)
+    .filter(
+      (row) =>
+        row.deletedAt === null ||
+        row.syncState === SYNC_STATE.CONFLICT ||
+        row.syncState === SYNC_STATE.REJECTED
+    )
     .toArray();
 }
 
@@ -196,4 +219,50 @@ export async function countPendingRecords() {
     .where("[createdBy+syncState]")
     .equals([user.userId, SYNC_STATE.PENDING])
     .count();
+}
+
+/**
+ * Unsynced work sitting on this device, counted across EVERY worker who has
+ * used it — not only the one signed in now.
+ *
+ * This is the one read in the file that deliberately ignores the ownership
+ * scoping every other query enforces, and it exists precisely because that
+ * scoping is otherwise total. Phones get handed on. A worker signs in, sees
+ * "0 waiting to sync", and has no way to learn that a colleague's week of
+ * household visits is sitting in the same IndexedDB — invisible to every list,
+ * every count and every sync, because all of them are correctly scoped to the
+ * person holding the phone. That is exactly the state in which a device gets
+ * wiped or passed along, and the work is gone.
+ *
+ * It returns counts only. Who the other worker is stays out of it: authCache
+ * holds one row by design, so this device does not know a colleague's name, and
+ * it has no business learning one to render a warning.
+ *
+ * "Unsynced" is every row the server has not accepted — pending, conflicted and
+ * rejected alike. A conflicted row's pushed copy does survive server-side in
+ * record_conflicts, so counting it here errs toward warning about a record that
+ * could in fact be recovered. That is the right direction to be wrong in.
+ *
+ * A full scan, because syncState is only indexed beside createdBy and there is
+ * no way to range across every worker at once. It runs when a screen loads and
+ * before a destructive action, never in a loop.
+ */
+export async function countUnsyncedOnDevice() {
+  const user = await getCachedUser();
+  const otherOwners = new Set();
+  let mine = 0;
+  let others = 0;
+
+  await db.records.each((row) => {
+    if (row.syncState === SYNC_STATE.SYNCED) return;
+
+    if (user && row.createdBy === user.userId) {
+      mine += 1;
+    } else {
+      others += 1;
+      otherOwners.add(row.createdBy);
+    }
+  });
+
+  return { mine, others, otherWorkers: otherOwners.size, total: mine + others };
 }

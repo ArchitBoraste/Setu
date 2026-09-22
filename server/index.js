@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import { pool } from "./db/index.js";
 import authRoutes from "./routes/auth.js";
+import syncRoutes from "./routes/sync.js";
 
 // Last-resort visibility. `node --watch` clears the terminal when it restarts
 // a crashed process, so without these a fatal error can scroll away before it
@@ -67,6 +68,7 @@ app.get("/api/db-health", async (req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/sync", syncRoutes);
 
 // 404 handler — anything not matched above
 app.use((req, res) => {

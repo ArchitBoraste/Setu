@@ -1,12 +1,19 @@
-import { useCallback, useEffect, useState } from "react";
+import { Fragment, useCallback, useEffect, useState } from "react";
 import {
   SYNC_STATE,
   countPendingRecords,
+  countUnsyncedOnDevice,
   createRecord,
   listRecords,
   softDeleteRecord,
   updateRecord,
 } from "./recordService.js";
+import {
+  SYNC_EVENT,
+  getLastSyncAt,
+  runSync,
+  startSyncOnReconnect,
+} from "../sync/syncEngine.js";
 
 // Temporary capture screen. The form is hardcoded so there is real data to sync
 // in the next step; the dynamic form builder replaces it later.
@@ -63,6 +70,22 @@ const EMPTY_FORM = {
   notes: "",
 };
 
+const FIELD_LABELS = {
+  householdName: "Household name",
+  memberCount: "Members",
+  childrenUnderFive: "Children under five",
+  visitDate: "Visit date",
+  waterSource: "Water source",
+  notes: "Notes",
+};
+
+const BADGE_COLOURS = {
+  [SYNC_STATE.SYNCED]: "seagreen",
+  [SYNC_STATE.CONFLICT]: "crimson",
+  [SYNC_STATE.REJECTED]: "#7f1d1d",
+  [SYNC_STATE.PENDING]: "#b45309",
+};
+
 const styles = {
   section: { marginTop: "2rem", borderTop: "1px solid #ddd", paddingTop: "1rem" },
   label: { display: "block", marginBottom: "0.75rem" },
@@ -74,25 +97,48 @@ const styles = {
     borderRadius: 999,
     fontSize: 12,
     color: "#fff",
-    background:
-      state === SYNC_STATE.SYNCED
-        ? "seagreen"
-        : state === SYNC_STATE.CONFLICT
-          ? "crimson"
-          : "#b45309",
+    background: BADGE_COLOURS[state] ?? "#666",
   }),
   error: { color: "crimson" },
   muted: { color: "#666", fontSize: 14 },
+  syncBar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "0.5rem",
+    flexWrap: "wrap",
+    margin: "0.5rem 0",
+  },
+  notice: (tone) => ({
+    padding: "0.5rem 0.75rem",
+    borderRadius: 4,
+    fontSize: 14,
+    border: `1px solid ${tone === "warn" ? "#b45309" : "#ccc"}`,
+    background: tone === "warn" ? "#fffbeb" : "#f6f6f6",
+  }),
+  compare: {
+    display: "grid",
+    gridTemplateColumns: "10rem 1fr 1fr",
+    gap: "0.25rem 0.75rem",
+    fontSize: 13,
+    marginTop: "0.5rem",
+    padding: "0.5rem",
+    background: "#fafafa",
+    border: "1px solid #eee",
+  },
+  compareHead: { fontWeight: 600 },
+  differs: { background: "#fff1f2" },
 };
 
 // Reads only; the caller decides what to do with the result. Keeping state out
 // of here is what lets the mount effect use it without setting state mid-render.
 async function loadRecords() {
-  const [rows, pendingCount] = await Promise.all([
+  const [rows, pendingCount, lastSyncAt, deviceCounts] = await Promise.all([
     listRecords(),
     countPendingRecords(),
+    getLastSyncAt(),
+    countUnsyncedOnDevice(),
   ]);
-  return { rows, pendingCount };
+  return { rows, pendingCount, lastSyncAt, deviceCounts };
 }
 
 function summarise(record) {
@@ -101,6 +147,10 @@ function summarise(record) {
   return [householdName || "(no name)", visitDate, `${memberCount ?? "?"} members`]
     .filter(Boolean)
     .join(" · ");
+}
+
+function showValue(value) {
+  return value === null || value === undefined || value === "" ? "—" : String(value);
 }
 
 function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
@@ -165,13 +215,84 @@ function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
   );
 }
 
-function RecordRow({ record, onEdit, onDelete, busy }) {
+/**
+ * Both copies of a conflicted record, side by side and read-only.
+ *
+ * There is no resolve action here — that is step 12. What a worker must never
+ * have is a red badge with nothing behind it: "conflict" means nothing to
+ * somebody who cannot see what the two sides actually disagree about, and a
+ * worker who cannot see it will assume their visit was lost. Differing fields
+ * are tinted so the disagreement is findable without reading every row.
+ */
+function ConflictCompare({ record }) {
+  const server = record.serverConflict;
+  if (!server) return null;
+
+  const fields = [...new Set([...Object.keys(record.payload), ...Object.keys(server.payload ?? {})])];
+
+  return (
+    <div style={styles.compare}>
+      <span style={styles.compareHead} />
+      <span style={styles.compareHead}>On this device (v{record.version})</span>
+      <span style={styles.compareHead}>On the server (v{server.version})</span>
+
+      {fields.map((field) => {
+        const mine = record.payload?.[field] ?? null;
+        const theirs = server.payload?.[field] ?? null;
+        const differs = mine !== theirs;
+        return (
+          <Fragment key={field}>
+            <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
+            <span style={differs ? styles.differs : undefined}>{showValue(mine)}</span>
+            <span style={differs ? styles.differs : undefined}>{showValue(theirs)}</span>
+          </Fragment>
+        );
+      })}
+
+      <span style={styles.muted}>Deleted</span>
+      <span>{record.deletedAt ? "yes" : "no"}</span>
+      <span>{server.deletedAt ? "yes" : "no"}</span>
+
+      <span style={styles.muted}>Server saved</span>
+      <span>—</span>
+      <span>{server.updatedAt ?? "—"}</span>
+    </div>
+  );
+}
+
+function RecordRow({ record, onEdit, onDelete, busy, expanded, onToggle }) {
+  const isConflict = record.syncState === SYNC_STATE.CONFLICT;
+  const isRejected = record.syncState === SYNC_STATE.REJECTED;
+
   return (
     <li style={styles.row}>
       <span style={styles.badge(record.syncState)}>{record.syncState}</span>{" "}
       {summarise(record)}{" "}
       <span style={styles.muted}>v{record.version}</span>
+      {record.deletedAt && <span style={styles.muted}> · deleted</span>}
       <br />
+
+      {isConflict && (
+        <p style={styles.muted}>
+          Someone else changed this record on the server before your copy arrived.
+          Both versions are kept — a supervisor decides which one stands.{" "}
+          <button onClick={() => onToggle(record.id)}>
+            {expanded ? "Hide both versions" : "Compare both versions"}
+          </button>
+        </p>
+      )}
+
+      {isConflict && expanded && <ConflictCompare record={record} />}
+
+      {isRejected && (
+        <p style={styles.muted}>
+          {/* Server messages are fragments, not sentences, so the full stop is
+              added here rather than in every reason string. */}
+          The server refused this record: {record.syncError?.message ?? "no reason given"}.{" "}
+          It is still saved on this device. Editing it will send it again.
+        </p>
+      )}
+
       <button onClick={() => onEdit(record)} disabled={busy}>
         Edit
       </button>{" "}
@@ -182,27 +303,115 @@ function RecordRow({ record, onEdit, onDelete, busy }) {
   );
 }
 
+function lastSyncedLabel(lastSyncAt) {
+  if (!lastSyncAt) return "Never synced";
+  // The device clock, and only ever shown, never compared. The sync cursor is
+  // the server's timestamp and lives elsewhere.
+  return `Last synced ${new Date(lastSyncAt).toLocaleString()}`;
+}
+
+/**
+ * Another worker's unsent records, reported separately from the current user's.
+ *
+ * Kept apart from the "waiting to sync" count rather than folded into it,
+ * because they are not the same fact and do not have the same remedy. The
+ * signed-in worker cannot send these — the sync engine will not push another
+ * user's rows under this user's token, which is correct — so a single combined
+ * number would tell them to press a button that will never clear it.
+ *
+ * Without this line the phone reads "0 waiting to sync" over a database holding
+ * somebody else's week of visits, which is the exact state in which a device
+ * gets wiped or handed on.
+ */
+function OtherWorkerNotice({ deviceCounts }) {
+  if (!deviceCounts || deviceCounts.others === 0) return null;
+
+  const { others, otherWorkers } = deviceCounts;
+  const one = others === 1;
+  // Object and subject forms are tracked separately: "sync them" but "they have
+  // synced", and the two are not interchangeable.
+  const them = one ? "it" : "them";
+  const theyHave = one ? "it has" : "they have";
+
+  return (
+    <p style={styles.notice("warn")}>
+      <strong>
+        {others} {one ? "record" : "records"} captured by{" "}
+        {otherWorkers === 1 ? "another worker" : `${otherWorkers} other workers`}{" "}
+        {one ? "is" : "are"} also on this phone, still unsent.
+      </strong>{" "}
+      Only the worker who collected {them} can sync {them}, after signing in
+      here. Do not wipe or hand on this phone until {theyHave} synced.
+    </p>
+  );
+}
+
+function SyncNotice({ summary }) {
+  if (!summary) return null;
+
+  if (summary.needsOnlineSignIn) {
+    return (
+      <p style={styles.notice("warn")}>
+        <strong>Sign in to sync.</strong> You signed in on this device without a
+        connection, so it has no session with the server yet. Your records are
+        safe and still waiting — sign out and sign in again with your password
+        while you have signal, then sync.
+      </p>
+    );
+  }
+
+  if (summary.transportError) {
+    return (
+      <p style={styles.notice("warn")}>
+        Could not reach the server: {summary.transportError}. Nothing was lost —
+        every record is still waiting on this device.
+      </p>
+    );
+  }
+
+  if (summary.attempted === 0) {
+    return <p style={styles.notice()}>Nothing waiting to sync.</p>;
+  }
+
+  const parts = [`${summary.accepted} sent`];
+  if (summary.conflicts) parts.push(`${summary.conflicts} in conflict`);
+  if (summary.rejected) parts.push(`${summary.rejected} refused`);
+  if (summary.failed) parts.push(`${summary.failed} to retry`);
+
+  return <p style={styles.notice()}>{parts.join(" · ")}</p>;
+}
+
 export default function CaptureScreen() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [editingId, setEditingId] = useState(null);
   const [records, setRecords] = useState([]);
   const [pending, setPending] = useState(0);
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [deviceCounts, setDeviceCounts] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncSummary, setSyncSummary] = useState(null);
+  const [expandedId, setExpandedId] = useState(null);
 
   const refresh = useCallback(async () => {
-    const { rows, pendingCount } = await loadRecords();
+    const { rows, pendingCount, lastSyncAt: at, deviceCounts: counts } =
+      await loadRecords();
     setRecords(rows);
     setPending(pendingCount);
+    setLastSyncAt(at);
+    setDeviceCounts(counts);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     loadRecords()
-      .then(({ rows, pendingCount }) => {
+      .then(({ rows, pendingCount, lastSyncAt: at, deviceCounts: counts }) => {
         if (cancelled) return;
         setRecords(rows);
         setPending(pendingCount);
+        setLastSyncAt(at);
+        setDeviceCounts(counts);
       })
       .catch((err) => {
         if (!cancelled) setError(`Could not read local records: ${err.message}`);
@@ -212,11 +421,35 @@ export default function CaptureScreen() {
     };
   }, []);
 
+  // A sync can also start without anyone pressing anything — the "online" event
+  // fires wherever the worker happens to be in the app — so the list listens for
+  // the result rather than only updating after its own button.
+  useEffect(() => {
+    const stopReconnectSync = startSyncOnReconnect();
+
+    const onSynced = (event) => {
+      setSyncSummary(event.detail);
+      void refresh().catch(() => {});
+    };
+    window.addEventListener(SYNC_EVENT, onSynced);
+
+    return () => {
+      stopReconnectSync();
+      window.removeEventListener(SYNC_EVENT, onSynced);
+    };
+  }, [refresh]);
+
   // Every mutation follows the same shape: write to Dexie, then re-read. The
   // write itself never touches the network, so this stays instant offline.
   async function run(action) {
     setBusy(true);
     setError(null);
+    // The sync notice describes a run that has now been overtaken — capturing or
+    // editing a record makes "nothing waiting to sync" a lie the moment it is
+    // written. Left on screen it contradicts the counter beside it, and a worker
+    // reading "nothing waiting" over a queue of three has no reason to press
+    // Sync again.
+    setSyncSummary(null);
     try {
       await action();
       await refresh();
@@ -226,6 +459,27 @@ export default function CaptureScreen() {
       setBusy(false);
     }
   }
+
+  // Not routed through run(): a sync must not disable the form. A worker on a
+  // slow connection should be able to keep capturing while the push is in the
+  // air, which is the whole reason capture and sync are separate layers.
+  const handleSync = async () => {
+    setSyncing(true);
+    setSyncSummary(null);
+    try {
+      // The SYNC_EVENT listener above applies the summary and refreshes, so
+      // there is nothing to do with the returned value here.
+      await runSync();
+    } catch (err) {
+      // runSync folds every expected failure into its summary, so reaching here
+      // means something underneath broke — an unreadable database, most likely.
+      // Without this the rejection escapes the click handler entirely and the
+      // button just stops working with nothing on screen to say why.
+      setError(`Sync could not run: ${err.message}`);
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const handleSubmit = (event) => {
     event.preventDefault();
@@ -265,12 +519,23 @@ export default function CaptureScreen() {
     setForm(EMPTY_FORM);
   };
 
+  const toggleExpanded = (id) => setExpandedId((current) => (current === id ? null : id));
+
   return (
     <div style={styles.section}>
       <h2>Household survey</h2>
-      <p style={styles.muted}>
-        Saved on this device · <strong>{pending}</strong> waiting to sync
-      </p>
+
+      <div style={styles.syncBar}>
+        <button onClick={handleSync} disabled={syncing}>
+          {syncing ? "Syncing…" : "Sync now"}
+        </button>
+        <span style={styles.muted}>
+          <strong>{pending}</strong> waiting to sync · {lastSyncedLabel(lastSyncAt)}
+        </span>
+      </div>
+
+      <SyncNotice summary={syncSummary} />
+      <OtherWorkerNotice deviceCounts={deviceCounts} />
 
       {error && <p style={styles.error}>{error}</p>}
 
@@ -295,6 +560,8 @@ export default function CaptureScreen() {
               onEdit={handleEdit}
               onDelete={handleDelete}
               busy={busy}
+              expanded={expandedId === record.id}
+              onToggle={toggleExpanded}
             />
           ))}
         </ul>

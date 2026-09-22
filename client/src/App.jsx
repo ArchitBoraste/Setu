@@ -7,6 +7,7 @@ import {
 } from "./auth/authService.js";
 import UpdatePrompt from "./components/UpdatePrompt.jsx";
 import CaptureScreen from "./records/CaptureScreen.jsx";
+import RemoveAccountPanel from "./records/RemoveAccountPanel.jsx";
 import { DATABASE_OUTDATED_EVENT } from "./db/index.js";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
@@ -93,14 +94,18 @@ function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
         <br />
         Phone {user.phone} · via {mode}
       </p>
+      {/* Sign out stands alone. It is the safe, ordinary action — it deletes
+          tokens and leaves every record on the phone — and it used to sit one
+          button's width from the one that destroys them. Removing an account is
+          now a separate section below the records it would delete, so the two
+          can no longer be confused for variants of the same thing. */}
       <button onClick={onSignOut} disabled={busy}>
         Sign out
-      </button>{" "}
-      <button onClick={onRemove} disabled={busy}>
-        Remove account from device
       </button>
 
       <CaptureScreen />
+
+      <RemoveAccountPanel onRemove={onRemove} busy={busy} />
     </div>
   );
 }
@@ -175,15 +180,15 @@ export default function App() {
       setSession(null);
     });
 
-  const handleRemove = () => {
-    if (!window.confirm("Remove this account and all its local data from the device?")) {
-      return;
-    }
-    return run(async () => {
+  // No window.confirm here any more. RemoveAccountPanel owns the confirmation,
+  // because only it can count what is about to be destroyed — and a browser
+  // dialog cannot show a number, cannot be worded by us, and is dismissed with a
+  // single reflex click.
+  const handleRemove = () =>
+    run(async () => {
       await removeAccountFromDevice();
       setSession(null);
     });
-  };
 
   return (
     <div style={styles.page}>

@@ -12,6 +12,25 @@ CREATE TABLE organizations (
   PRIMARY KEY (id)
 ) ENGINE=InnoDB;
 
+-- A village or ward. The unit field workers share records within: a worker
+-- sees and changes the records of their own area, so a lost phone exposes one
+-- area rather than the organisation. See migrations/004_areas.sql.
+CREATE TABLE areas (
+  id              CHAR(36)     NOT NULL,
+  organization_id CHAR(36)     NOT NULL,
+  name            VARCHAR(150) NOT NULL,
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  -- One "Wadgaon" per organisation. Also what lets the seed be re-run safely.
+  UNIQUE KEY uq_areas_org_name (organization_id, name),
+  -- The target of the composite foreign keys on users and records, which is
+  -- what stops anyone being placed in another organisation's area.
+  UNIQUE KEY uq_areas_org_id (organization_id, id),
+  CONSTRAINT fk_areas_org FOREIGN KEY (organization_id)
+    REFERENCES organizations (id) ON DELETE RESTRICT
+) ENGINE=InnoDB;
+
 -- Field workers, supervisors, admins. Created online only.
 CREATE TABLE users (
   id              CHAR(36)     NOT NULL,
@@ -21,6 +40,11 @@ CREATE TABLE users (
   email           VARCHAR(200) NULL,
   password_hash   VARCHAR(255) NOT NULL,          -- bcrypt output, never the password
   role            ENUM('field_worker','supervisor','admin') NOT NULL DEFAULT 'field_worker',
+  -- The area a field worker covers. NULL: no area, so they see only what they
+  -- captured themselves. Ignored for supervisors and admins, who see the
+  -- organisation. Read from here on every sync request, never from the token,
+  -- so moving a worker takes effect without a new sign-in.
+  area_id         CHAR(36)     NULL,
   is_active       TINYINT(1)   NOT NULL DEFAULT 1,
   last_login_at   DATETIME(3)  NULL,
   created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -29,8 +53,11 @@ CREATE TABLE users (
   PRIMARY KEY (id),
   UNIQUE KEY uq_users_phone (phone),              -- login identifier, must be unique
   KEY idx_users_org (organization_id),
+  KEY idx_users_org_area (organization_id, area_id),
   CONSTRAINT fk_users_org FOREIGN KEY (organization_id)
-    REFERENCES organizations (id) ON DELETE RESTRICT
+    REFERENCES organizations (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_users_area FOREIGN KEY (organization_id, area_id)
+    REFERENCES areas (organization_id, id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 
 -- Long-lived refresh tokens. Access tokens stay short-lived and are never stored.
@@ -73,6 +100,13 @@ CREATE TABLE records (
   id              CHAR(36)     NOT NULL,          -- client-generated UUID
   organization_id CHAR(36)     NOT NULL,
   created_by      CHAR(36)     NOT NULL,          -- the worker who captured it
+  -- Set by the server at first insert from the capturing user's area, and
+  -- never changed by a push. NULL for records captured before areas existed or
+  -- by a user with no area: visible only to their creator and to supervisors.
+  area_id         CHAR(36)     NULL,
+  -- Whose change the server last accepted: the pusher, or the resolver of a
+  -- conflict. NULL means not recorded (rows written before migration 004).
+  updated_by      CHAR(36)     NULL,
   device_id       CHAR(36)     NOT NULL,          -- which phone it came from, for audit and conflict attribution
   form_type       VARCHAR(64)  NOT NULL,          -- one table holds several survey kinds until the form builder lands
   form_version    INT          NOT NULL DEFAULT 1, -- which revision of that form produced the payload
@@ -82,15 +116,24 @@ CREATE TABLE records (
   updated_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   deleted_at      DATETIME(3)  NULL,
   PRIMARY KEY (id),
-  -- The delta pull: everything in my org changed since my cursor.
+  -- A supervisor's delta pull: everything in my org changed since my cursor.
   KEY idx_records_org_updated (organization_id, updated_at),
-  -- One worker's own records, which is all a field worker's device ever pulls.
+  -- A worker's own records with no area, the second half of a field worker's
+  -- pull.
   KEY idx_records_user_updated (created_by, updated_at),
+  -- A field worker's delta pull: everything in my area changed since my cursor.
+  KEY idx_records_org_area_updated (organization_id, area_id, updated_at),
+  KEY idx_records_updated_by (updated_by),
   CONSTRAINT fk_records_org FOREIGN KEY (organization_id)
     REFERENCES organizations (id) ON DELETE RESTRICT,
   -- RESTRICT, not CASCADE: deleting a user must never silently destroy the
   -- field data they collected.
   CONSTRAINT fk_records_user FOREIGN KEY (created_by)
+    REFERENCES users (id) ON DELETE RESTRICT,
+  -- Composite, so a record can never sit in another organisation's area.
+  CONSTRAINT fk_records_area FOREIGN KEY (organization_id, area_id)
+    REFERENCES areas (organization_id, id) ON DELETE RESTRICT,
+  CONSTRAINT fk_records_updated_by FOREIGN KEY (updated_by)
     REFERENCES users (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
 

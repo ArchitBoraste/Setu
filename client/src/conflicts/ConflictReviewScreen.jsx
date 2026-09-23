@@ -110,6 +110,13 @@ function VersionCompare({ conflict }) {
         {submitted.byName} · {deviceLabel(submitted)}
       </span>
 
+      {/* Workers in one area now change each other's records, so the person
+          whose version the worker's copy collided with is usually not the one
+          who captured the household. */}
+      <span style={styles.muted}>Last change by</span>
+      <span>{current.updatedByName ?? "not recorded"}</span>
+      <span>{submitted.byName}</span>
+
       <span style={styles.muted}>When</span>
       <span>{shortTime(current.updatedAt) ?? "—"}</span>
       {/* "Received", not "captured": record_conflicts stores when the push was
@@ -406,6 +413,7 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
     <li style={styles.card}>
       <strong>{conflict.current.payload?.householdName || "(no name)"}</strong>{" "}
       <span style={styles.muted}>
+        {conflict.areaName ? `${conflict.areaName} · ` : ""}
         record {short(conflict.recordId)} · {conflict.submitted.formType} · raised{" "}
         {shortTime(conflict.createdAt)}
       </span>

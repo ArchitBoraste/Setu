@@ -209,7 +209,21 @@ CREATE DATABASE setu CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 Get-Content server/db/schema.sql | mysql -u root -p setu
 ```
 
+`schema.sql` is always the complete, current schema. A database created from an older copy is brought up to date by running the migrations it is missing, in order, once each:
+
+```powershell
+Get-Content server/db/migrations/004_areas.sql | mysql -u root -p setu
+```
+
 **4. Make your `server/.env` file** by copying `server/.env.example` and filling in your own MySQL password.
+
+**4b. Seed the demo organisation, area and users** (safe to run again — it never duplicates anything):
+
+```bash
+npm run seed -w server
+```
+
+`npm run demo:reset -w server` also deletes every record, conflict and refresh token first, for a clean rehearsal.
 
 **5. Start both (two terminals):**
 

@@ -6,6 +6,7 @@ import {
   MAX_PULL_LIMIT,
   keysetFrom,
   resolveWindow,
+  sinceForScope,
   validatePullQuery,
   validateResolutionQuery,
 } from "../sync/pullRules.js";
@@ -102,6 +103,7 @@ describe("validatePullQuery", () => {
         afterUpdatedAt: null,
         afterId: null,
         pageSize: DEFAULT_PULL_LIMIT,
+        requestedScope: null,
       });
     }
   });
@@ -128,6 +130,7 @@ describe("validatePullQuery", () => {
       afterUpdatedAt: null,
       afterId: null,
       pageSize: DEFAULT_PULL_LIMIT,
+      requestedScope: null,
     });
   });
 
@@ -178,6 +181,7 @@ describe("validateResolutionQuery", () => {
       afterResolvedAt: null,
       afterId: null,
       pageSize: DEFAULT_PULL_LIMIT,
+      requestedScope: null,
     });
   });
 
@@ -213,6 +217,7 @@ describe("validateResolutionQuery", () => {
       afterResolvedAt: EARLIER_EDGE,
       afterId: RECORD_ID,
       pageSize: 7,
+      requestedScope: null,
     });
   });
 
@@ -373,5 +378,56 @@ describe("keyset pagination over one window", () => {
     const all = [...first.delivered, ...second.delivered];
     assert.equal(new Set(all).size, all.length, "a row was delivered twice");
     assert.deepEqual([...all].sort(), ROWS.map((row) => row.id).sort());
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sinceForScope — a cursor is honoured only in the scope it was advanced in
+// ---------------------------------------------------------------------------
+
+const WADGAON_SCOPE = "area:2c3d4e5f-6071-4b8c-9d0e-1f2a3b4c5d6e";
+const SHIRUR_SCOPE = "area:8d9e0f1a-2b3c-4d5e-8f6a-7b8c9d0e1f2a";
+
+describe("sinceForScope", () => {
+  test("a cursor from the caller's current scope is honoured", () => {
+    const since = sinceForScope({
+      since: CURSOR,
+      requestedScope: WADGAON_SCOPE,
+      scopeKey: WADGAON_SCOPE,
+    });
+    assert.equal(since, CURSOR);
+  });
+
+  // The failure this exists for: a worker moved to Shirur, still holding a
+  // Wadgaon cursor, would otherwise never be sent Shirur's older records.
+  test("a cursor from another area starts the window from the beginning", () => {
+    const since = sinceForScope({
+      since: CURSOR,
+      requestedScope: WADGAON_SCOPE,
+      scopeKey: SHIRUR_SCOPE,
+    });
+    assert.equal(since, EPOCH_CURSOR);
+  });
+
+  test("a cursor that names no scope starts the window from the beginning", () => {
+    const since = sinceForScope({ since: CURSOR, requestedScope: null, scopeKey: WADGAON_SCOPE });
+    assert.equal(since, EPOCH_CURSOR);
+  });
+});
+
+describe("the cursor's scope on the query string", () => {
+  test("a scope key the server minted is passed through by both feeds", () => {
+    for (const validate of [validatePullQuery, validateResolutionQuery]) {
+      const { value } = validate({ since: CURSOR, scope: WADGAON_SCOPE });
+      assert.equal(value.requestedScope, WADGAON_SCOPE);
+    }
+  });
+
+  test("anything else is refused by both feeds rather than guessed at", () => {
+    for (const validate of [validatePullQuery, validateResolutionQuery]) {
+      for (const scope of ["", "wadgaon", "area:", `${WADGAON_SCOPE},x`, [WADGAON_SCOPE]]) {
+        assert.ok(validate({ scope }).error, `scope ${JSON.stringify(scope)}`);
+      }
+    }
   });
 });

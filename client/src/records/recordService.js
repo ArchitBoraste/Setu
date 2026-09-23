@@ -4,6 +4,12 @@ import { getCachedUser } from "../auth/authService.js";
 import { getDeviceId, newUuid } from "../lib/device.js";
 import { toServerTimeString } from "../lib/time.js";
 import { SYNC_STATE } from "./syncState.js";
+import {
+  EDIT_BLOCK,
+  canSeeRecord,
+  countUnsynced,
+  editBlockReason,
+} from "./scope.js";
 
 // No network code lives in this file, by design. Capture writes to IndexedDB and
 // returns; the sync layer moves rows to the server on its own schedule.
@@ -63,12 +69,17 @@ async function requireUser() {
  * serverUpdatedAt is the authoritative value and stays null until the server
  * stamps the row.
  */
-function stampLocalWrite(row, changes) {
+function stampLocalWrite(row, changes, user) {
   return {
     ...row,
     ...changes,
     version: row.version + 1,
     localUpdatedAt: Date.now(),
+    // Whose change this is, which is whose sync sends it. See belongsToPushQueue
+    // in scope.js: a row now changes hands between people, and the push has to
+    // go out under the token of the person who made the edit.
+    lastEditedBy: user.userId,
+    updatedByName: user.fullName,
     syncState: SYNC_STATE.PENDING,
     // Editing is how a worker gets a rejected row moving again: it re-enters the
     // push queue, and the old reason no longer describes what is about to be
@@ -107,41 +118,47 @@ function stampLocalWrite(row, changes) {
  * REJECTED is deliberately NOT blocked. A rejection means the payload was
  * malformed, and editing is the only way a worker can fix it and get the row
  * moving again.
+ *
+ * A row holding ANOTHER person's unsent change is blocked too — see
+ * editBlockReason in scope.js for why that change has to go out first.
  */
-function assertEditable(row) {
-  if (row.syncState === SYNC_STATE.CONFLICT) {
+function assertEditable(row, user) {
+  const reason = editBlockReason(row, user);
+  if (reason === EDIT_BLOCK.CONFLICT) {
     throw new RecordError(
       "This record is waiting for a supervisor to decide which version is right. " +
         "You can compare both versions, but it cannot be changed until then."
     );
   }
-}
-
-// Every read is scoped to the signed-in worker. Phones get handed between
-// workers, and one worker must never see, edit or sync another's records, even
-// though both sets sit in the same IndexedDB on the same device.
-function ownedBy(row, user) {
-  return row && row.createdBy === user.userId;
+  if (reason === EDIT_BLOCK.OTHER_EDITOR) {
+    throw new RecordError(
+      "Someone else changed this record on this phone and has not synced it yet. " +
+        "It can be changed again once they sign in here and sync."
+    );
+  }
 }
 
 /**
- * Applies a change to one record the current user owns.
- * Read, ownership check and write happen inside a transaction so two edits of
- * the same row cannot both read version N and both write N+1.
+ * Applies a change to one record the current user can see.
+ * Read, scope check and write happen inside a transaction so two edits of the
+ * same row cannot both read version N and both write N+1.
  */
-async function updateOwnedRecord(id, changes) {
+async function updateVisibleRecord(id, changes) {
   assertWritable();
   const user = await requireUser();
 
   return db.transaction("rw", db.records, async () => {
     const row = await db.records.get(id);
-    if (!ownedBy(row, user)) throw new RecordError("Record not found.");
+    // Phones are shared, so a row being on the device says nothing about
+    // whether this user may touch it. Reported as missing, not refused: whether
+    // it exists is itself none of this user's business.
+    if (!canSeeRecord(row, user)) throw new RecordError("Record not found.");
     // Checked inside the transaction, on the row as stored. A sync running in
     // another tab may have moved this row into conflict since the screen drew
     // the Edit button.
-    assertEditable(row);
+    assertEditable(row, user);
 
-    const updated = stampLocalWrite(row, changes);
+    const updated = stampLocalWrite(row, changes, user);
     await db.records.put(updated);
     return updated;
   });
@@ -163,6 +180,16 @@ export async function createRecord({ formType, formVersion = 1, payload }) {
     id: newUuid(),
     organizationId: user.organizationId,
     createdBy: user.userId,
+    // Names for the list, which is shared once supervisors see everyone's rows.
+    // The server's own copies replace these on the next pull.
+    createdByName: user.fullName,
+    updatedByName: user.fullName,
+    // Who made the change waiting to go out. See belongsToPushQueue in scope.js.
+    lastEditedBy: user.userId,
+    // Provisional, so the new row shows in this worker's list straight away.
+    // The server sets the real area from its own database when the row first
+    // arrives, and the push answer replaces this with it.
+    areaId: user.areaId ?? null,
     deviceId,
     formType,
     // Which revision of the form produced these answers. A payload is only
@@ -195,7 +222,7 @@ export async function createRecord({ formType, formVersion = 1, payload }) {
 }
 
 export function updateRecord(id, payload) {
-  return updateOwnedRecord(id, { payload });
+  return updateVisibleRecord(id, { payload });
 }
 
 /**
@@ -209,13 +236,13 @@ export function softDeleteRecord(id) {
   // representation across both sides now — see lib/time.js for why it is the
   // server's format and why this device-clock value is provisional until the
   // first successful push answers with the authoritative one.
-  return updateOwnedRecord(id, { deletedAt: toServerTimeString() });
+  return updateVisibleRecord(id, { deletedAt: toServerTimeString() });
 }
 
 /**
  * Clears the "a supervisor decided this" notice from a row.
  *
- * Deliberately NOT routed through updateOwnedRecord: dismissing a notice is not
+ * Deliberately NOT routed through updateVisibleRecord: dismissing a notice is not
  * an edit to the record. Going through stampLocalWrite would bump version, mark
  * the row PENDING and push it — so acknowledging that a supervisor resolved a
  * conflict would immediately raise the next one.
@@ -234,21 +261,16 @@ export async function dismissResolutionNotice(id) {
 
   return db.transaction("rw", db.records, async () => {
     const row = await db.records.get(id);
-    if (!ownedBy(row, user)) throw new RecordError("Record not found.");
+    if (!canSeeRecord(row, user)) throw new RecordError("Record not found.");
     await db.records.update(id, { resolvedNotice: null });
   });
 }
 
-function currentUserRange(user, indexKey) {
-  return db.records
-    .where(indexKey)
-    .between([user.userId, Dexie.minKey], [user.userId, Dexie.maxKey]);
-}
-
 /**
- * The current user's live records, newest first. Soft-deleted rows are filtered
- * out here rather than by an index, because IndexedDB drops rows with a null key
- * from an index entirely.
+ * The live records the signed-in user may see, newest first: the whole
+ * organisation for a supervisor, a field worker's own share otherwise (see
+ * canSeeRecord). Soft-deleted rows are filtered out here rather than by an
+ * index, because IndexedDB drops rows with a null key from an index entirely.
  *
  * The exception is a deleted row the server would not take. Hiding those would
  * leave a worker with a conflict or a rejection they are never shown and cannot
@@ -267,14 +289,17 @@ function currentUserRange(user, indexKey) {
 export async function listRecords() {
   const user = await requireUser();
 
-  return currentUserRange(user, "[createdBy+localUpdatedAt]")
+  return db.records
+    .where("[organizationId+localUpdatedAt]")
+    .between([user.organizationId, Dexie.minKey], [user.organizationId, Dexie.maxKey])
     .reverse()
     .filter(
       (row) =>
-        row.deletedAt === null ||
-        row.syncState === SYNC_STATE.CONFLICT ||
-        row.syncState === SYNC_STATE.REJECTED ||
-        row.resolvedNotice != null
+        canSeeRecord(row, user) &&
+        (row.deletedAt === null ||
+          row.syncState === SYNC_STATE.CONFLICT ||
+          row.syncState === SYNC_STATE.REJECTED ||
+          row.resolvedNotice != null)
     )
     .toArray();
 }
@@ -282,19 +307,21 @@ export async function listRecords() {
 export async function getRecord(id) {
   const user = await requireUser();
   const row = await db.records.get(id);
-  // Another worker's row is reported as missing rather than refused: whether it
-  // exists is itself none of this user's business.
-  return ownedBy(row, user) ? row : null;
+  // A row outside this user's scope is reported as missing rather than
+  // refused: whether it exists is itself none of this user's business.
+  return canSeeRecord(row, user) ? row : null;
 }
 
 /**
- * How many of this user's records are waiting to reach the server. Counts
- * soft-deleted rows too: a pending deletion is unsent work like any other.
+ * How many changes this user's next sync will send — the same lastEditedBy
+ * rule the push queue uses, so the number is exactly what Sync can clear.
+ * Counts soft-deleted rows too: a pending deletion is unsent work like any
+ * other.
  */
 export async function countPendingRecords() {
   const user = await requireUser();
   return db.records
-    .where("[createdBy+syncState]")
+    .where("[lastEditedBy+syncState]")
     .equals([user.userId, SYNC_STATE.PENDING])
     .count();
 }
@@ -303,44 +330,33 @@ export async function countPendingRecords() {
  * Unsynced work sitting on this device, counted across EVERY worker who has
  * used it — not only the one signed in now.
  *
- * This is the one read in the file that deliberately ignores the ownership
- * scoping every other query enforces, and it exists precisely because that
- * scoping is otherwise total. Phones get handed on. A worker signs in, sees
- * "0 waiting to sync", and has no way to learn that a colleague's week of
- * household visits is sitting in the same IndexedDB — invisible to every list,
- * every count and every sync, because all of them are correctly scoped to the
- * person holding the phone. That is exactly the state in which a device gets
- * wiped or passed along, and the work is gone.
+ * This is the one read in the file that deliberately ignores the scoping every
+ * other query enforces, and it exists precisely because that scoping is
+ * otherwise total. Phones get handed on. A worker signs in, sees "0 waiting to
+ * sync", and has no way to learn that a colleague's week of household visits is
+ * sitting in the same IndexedDB — invisible to every list, every count and
+ * every sync, because all of them are correctly scoped to the person holding
+ * the phone. That is exactly the state in which a device gets wiped or passed
+ * along, and the work is gone.
  *
- * It returns counts only. Who the other worker is stays out of it: authCache
- * holds one row by design, so this device does not know a colleague's name, and
- * it has no business learning one to render a warning.
+ * Split by who made each unsent change (lastEditedBy), not who created the
+ * record: "yours" has to mean "your Sync sends it". See countUnsynced in
+ * scope.js.
+ *
+ * It returns counts only. Who the other worker is stays out of it: the rows the
+ * warning is about may be outside the signed-in user's scope, and naming the
+ * person behind them would say more about those rows than the list may.
  *
  * "Unsynced" is every row the server has not accepted — pending, conflicted and
  * rejected alike. A conflicted row's pushed copy does survive server-side in
  * record_conflicts, so counting it here errs toward warning about a record that
  * could in fact be recovered. That is the right direction to be wrong in.
  *
- * A full scan, because syncState is only indexed beside createdBy and there is
- * no way to range across every worker at once. It runs when a screen loads and
- * before a destructive action, never in a loop.
+ * A full scan, because syncState is only indexed beside lastEditedBy and there
+ * is no way to range across every editor at once. It runs when a screen loads
+ * and before a destructive action, never in a loop.
  */
 export async function countUnsyncedOnDevice() {
   const user = await getCachedUser();
-  const otherOwners = new Set();
-  let mine = 0;
-  let others = 0;
-
-  await db.records.each((row) => {
-    if (row.syncState === SYNC_STATE.SYNCED) return;
-
-    if (user && row.createdBy === user.userId) {
-      mine += 1;
-    } else {
-      others += 1;
-      otherOwners.add(row.createdBy);
-    }
-  });
-
-  return { mine, others, otherWorkers: otherOwners.size, total: mine + others };
+  return countUnsynced(await db.records.toArray(), user);
 }

@@ -37,7 +37,7 @@ const SERVER_TIME_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$/;
 // against a copy nobody holds any more. server_version is still returned, as the
 // version the losing device actually collided with.
 //
-// Never SELECT *: password_hash is one join away on both user joins.
+// Never SELECT *: password_hash is one join away on every user join.
 const CONFLICT_COLUMNS = `
   rc.id,
   rc.record_id       AS recordId,
@@ -67,6 +67,8 @@ const CONFLICT_COLUMNS = `
   r.device_id        AS currentDeviceId,
   r.created_by       AS currentCreatedById,
   cu.full_name       AS currentCreatedByName,
+  uu.full_name       AS currentUpdatedByName,
+  ar.name            AS areaName,
   DATE_FORMAT(r.created_at, '${SERVER_TIME_FORMAT}') AS currentCreatedAt,
   DATE_FORMAT(r.updated_at, '${SERVER_TIME_FORMAT}') AS currentUpdatedAt,
   DATE_FORMAT(r.deleted_at, '${SERVER_TIME_FORMAT}') AS currentDeletedAt`;
@@ -76,7 +78,9 @@ const CONFLICT_JOINS = `
     JOIN records r  ON r.id  = rc.record_id
     JOIN users   su ON su.id = rc.submitted_by
     JOIN users   cu ON cu.id = r.created_by
-    LEFT JOIN users ru ON ru.id = rc.resolved_by`;
+    LEFT JOIN users ru ON ru.id = rc.resolved_by
+    LEFT JOIN users uu ON uu.id = r.updated_by
+    LEFT JOIN areas ar ON ar.id = r.area_id`;
 
 // Oldest first, by the conflict's OWN age, for both tabs.
 //
@@ -107,6 +111,8 @@ function toConflictView(row) {
   return {
     id: row.id,
     recordId: row.recordId,
+    // The village the household belongs to. Null for a record with no area.
+    areaName: row.areaName,
     status: row.status,
     resolution: row.resolution,
     createdAt: row.createdAt,
@@ -165,6 +171,10 @@ function toConflictView(row) {
       writtenByResolution: row.currentDeviceId === RESOLVED_DEVICE_ID,
       capturedById: row.currentCreatedById,
       capturedByName: row.currentCreatedByName,
+      // Whose change the server last accepted. Now that workers in one area
+      // edit each other's records, this — not the captor — is usually the
+      // person the losing push collided with. Null when not recorded.
+      updatedByName: row.currentUpdatedByName,
       capturedAt: row.currentCreatedAt,
       updatedAt: row.currentUpdatedAt,
       deletedAt: row.currentDeletedAt,
@@ -390,9 +400,15 @@ router.post(
             //                 tombstone's first-raised time (the push route's
             //                 rule); RESTORE clears it; KEEP writes back the value
             //                 read under this same lock, unchanged.
+            //
+            //   updated_by    the resolver, from the verified token. The new
+            //                 version is their decision, and every device's list
+            //                 says so — rather than naming whichever worker's
+            //                 push happened to land last.
             `UPDATE records
                 SET form_type = ?, form_version = ?, payload = CAST(? AS JSON),
-                    version = ?, device_id = ?, updated_at = ?, deleted_at = ?
+                    version = ?, device_id = ?, updated_by = ?, updated_at = ?,
+                    deleted_at = ?
               WHERE id = ?`,
             [
               write.formType,
@@ -400,6 +416,7 @@ router.post(
               write.payloadText,
               write.version,
               RESOLVED_DEVICE_ID,
+              req.user.id,
               serverNow,
               deletedAtAfter(write.existence, record.deletedAt, serverNow),
               record.id,

@@ -90,21 +90,29 @@ const pwa = VitePWA({
   },
 });
 
+//this tells vite: if react code tries to fetch url starting with '/api' ex '/api/health'....intercept it and forward it to the
+//target : "http://localhost:5000" ie the express backend
+
+//changeOrigin: true: This rewrites the request headers so that the Express server thinks the request originated from its own
+// port (5000) rather than the React port (5173). It's a standard practice to prevent backends from rejecting the request.
+const API_PROXY = {
+  "/api": {
+    target: "http://127.0.0.1:5000",
+    changeOrigin: true,
+  },
+};
+
 export default defineConfig({
   plugins: [react(), pwa],
   server: {
     port: 5173,
-    proxy: {
-      //this tells vite: if react code tries to fetch url starting with '/api' ex '/api/health'....intercept it and forward it to the
-      //target : "http://localhost:5000" ie the express backend
-
-      //changeOrigin: true: This rewrites the request headers so that the Express server thinks the request originated from its own 
-      // port (5000) rather than the React port (5173). It's a standard practice to prevent backends from rejecting the request.
-      
-      "/api": {
-        target: "http://127.0.0.1:5000",
-        changeOrigin: true,
-      },
-    },
+    proxy: API_PROXY,
+  },
+  // Named explicitly although Vite would fall back to server.proxy. The offline
+  // demo has to run on the production build (`vite preview`), because only the
+  // build precaches the whole app shell, and a preview that stopped proxying
+  // /api would make every sync look like "offline" for the wrong reason.
+  preview: {
+    proxy: API_PROXY,
   },
 });

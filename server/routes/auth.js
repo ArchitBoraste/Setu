@@ -31,6 +31,11 @@ function toProfile(user) {
     phone: user.phone,
     role: user.role,
     organizationId: user.organizationId,
+    // Null for a user with no area — every supervisor and admin, and any field
+    // worker not yet assigned one. The device uses it only to decide what to
+    // SHOW; sync scope is read from the database on every request.
+    areaId: user.areaId ?? null,
+    areaName: user.areaName ?? null,
   };
 }
 
@@ -46,10 +51,13 @@ router.post(
     }
 
     const [[user]] = await pool.query(
-      `SELECT id, full_name AS fullName, phone, role,
-              organization_id AS organizationId,
-              password_hash AS passwordHash, is_active AS isActive
-         FROM users WHERE phone = ? AND deleted_at IS NULL`,
+      `SELECT u.id, u.full_name AS fullName, u.phone, u.role,
+              u.organization_id AS organizationId,
+              u.area_id AS areaId, a.name AS areaName,
+              u.password_hash AS passwordHash, u.is_active AS isActive
+         FROM users u
+         LEFT JOIN areas a ON a.id = u.area_id
+        WHERE u.phone = ? AND u.deleted_at IS NULL`,
       [phone]
     );
 
@@ -120,9 +128,12 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const [[user]] = await pool.query(
-      `SELECT id, full_name AS fullName, phone, role,
-              organization_id AS organizationId
-         FROM users WHERE id = ? AND deleted_at IS NULL`,
+      `SELECT u.id, u.full_name AS fullName, u.phone, u.role,
+              u.organization_id AS organizationId,
+              u.area_id AS areaId, a.name AS areaName
+         FROM users u
+         LEFT JOIN areas a ON a.id = u.area_id
+        WHERE u.id = ? AND u.deleted_at IS NULL`,
       [req.user.id]
     );
 

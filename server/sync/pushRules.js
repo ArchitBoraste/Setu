@@ -7,6 +7,7 @@
 // literals and asserted on.
 
 import { Buffer } from "node:buffer";
+import { canSeeRecord } from "./scopeRules.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -483,6 +484,33 @@ function sameContent(stored, incoming) {
  * @param {object|null} stored       { version, deviceId, formType, formVersion, payload, deleted }
  * @param {object}      incoming     { deviceId, formType, formVersion, payload, deleted }
  */
+// ---------------------------------------------------------------------------
+// Who may write a stored row
+// ---------------------------------------------------------------------------
+
+/**
+ * May this caller change a row the server already holds?
+ *
+ * Exactly the rows they may see — see scopeRules.js. Supervisors and admins
+ * correct and remove records across their organisation. A field worker updates
+ * or deletes records in their own area, which is what lets two workers covering
+ * one village keep a household's record current between them, and any record
+ * with no area that they captured themselves. Creating is not decided here: a
+ * new row has no stored copy to be scoped by, and the server gives it the
+ * creator's own area.
+ *
+ * Phones are shared and a stolen token is a real thing, so this is re-checked
+ * per row rather than assumed from the fact that the row reached a device.
+ * `actor` comes from the verified JWT plus a fresh read of the user's area;
+ * the request body is never consulted.
+ *
+ * @param {object} actor   { id, role, organizationId, areaId }
+ * @param {object} stored  { organizationId, areaId, createdBy }
+ */
+export function mayWrite(actor, stored) {
+  return canSeeRecord(actor, stored);
+}
+
 export function classifyPush(baseVersion, stored, incoming) {
   // A row that has never synced sends null. Folding it to 0 puts the insert on
   // the same ladder as every other comparison instead of beside it.

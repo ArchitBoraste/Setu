@@ -15,8 +15,10 @@ import {
   runSync,
   startSyncOnReconnect,
 } from "../sync/syncEngine.js";
+import { getCachedUser } from "../auth/authService.js";
 import { shortTime } from "../lib/time.js";
 import CompareGrid from "../components/CompareGrid.jsx";
+import { EDIT_BLOCK, editBlockReason, seesWholeOrganisation } from "./scope.js";
 
 // Temporary capture screen. The form is hardcoded so there is real data to sync
 // in the next step; the dynamic form builder replaces it later.
@@ -124,14 +126,18 @@ const styles = {
 
 // Reads only; the caller decides what to do with the result. Keeping state out
 // of here is what lets the mount effect use it without setting state mid-render.
+//
+// The user is re-read with everything else rather than taken from a prop, so
+// the rules the rows are drawn by are the ones listRecords() just applied.
 async function loadRecords() {
-  const [rows, pendingCount, lastSyncAt, deviceCounts] = await Promise.all([
+  const [rows, pendingCount, lastSyncAt, deviceCounts, user] = await Promise.all([
     listRecords(),
     countPendingRecords(),
     getLastSyncAt(),
     countUnsyncedOnDevice(),
+    getCachedUser(),
   ]);
-  return { rows, pendingCount, lastSyncAt, deviceCounts };
+  return { rows, pendingCount, lastSyncAt, deviceCounts, user };
 }
 
 function summarise(record) {
@@ -216,10 +222,15 @@ function ConflictCompare({ record }) {
   const server = record.serverConflict;
   if (!server) return null;
 
+  // Who made the server's version, when the server has said. With workers
+  // sharing an area it is usually a colleague, and knowing which one is often
+  // enough to explain the disagreement.
+  const serverBy = server.updatedByName ? `, ${server.updatedByName}` : "";
+
   return (
     <CompareGrid
       leftLabel={`On this device (v${record.version})`}
-      rightLabel={`On the server (v${server.version})`}
+      rightLabel={`On the server (v${server.version}${serverBy})`}
       left={record.payload}
       right={server.payload}
       extraRows={[
@@ -389,7 +400,27 @@ function ResolutionNotice({ record, onDismiss, busy }) {
   );
 }
 
-function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onToggle }) {
+/**
+ * Whose record this is and whose change it carries.
+ *
+ * Two names, because once supervisors see everyone's rows "who captured this
+ * household" and "who changed it last" are different people often enough to
+ * matter. A name the server never recorded is said to be unrecorded rather
+ * than left blank or guessed at.
+ */
+function Attribution({ record }) {
+  const unsent =
+    record.syncState === SYNC_STATE.PENDING || record.syncState === SYNC_STATE.REJECTED;
+  return (
+    <span style={styles.muted}>
+      Created by {record.createdByName ?? "—"} · last change by{" "}
+      {record.updatedByName ?? "not recorded"}
+      {unsent && " (not yet on the server)"}
+    </span>
+  );
+}
+
+function RecordRow({ record, user, onEdit, onDelete, onDismiss, busy, expanded, onToggle }) {
   const isConflict = record.syncState === SYNC_STATE.CONFLICT;
   const isRejected = record.syncState === SYNC_STATE.REJECTED;
   const isPending = record.syncState === SYNC_STATE.PENDING;
@@ -397,6 +428,11 @@ function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onTogg
   const serverDeleted = record.serverConflict?.deletedAt != null;
   // Held by the old pull-side lock, not yet released. See the v6 upgrade.
   const awaitingRelease = isConflict && record.legacyDeletionLock === true;
+  // A colleague on this phone changed the row and has not synced it. See
+  // editBlockReason in scope.js; recordService refuses the write regardless.
+  const heldForOtherEditor =
+    user != null && editBlockReason(record, user) === EDIT_BLOCK.OTHER_EDITOR;
+  const locked = isConflict || heldForOtherEditor;
 
   return (
     <li style={styles.row}>
@@ -404,6 +440,8 @@ function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onTogg
       {summarise(record)}{" "}
       <span style={styles.muted}>v{record.version}</span>
       {record.deletedAt && <span style={styles.muted}> · deleted</span>}
+      <br />
+      <Attribution record={record} />
       <br />
 
       {isConflict && (
@@ -469,16 +507,23 @@ function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onTogg
           The rule itself is in assertEditable(): editing here would put the row
           back to PENDING, push it against the same stale base, and conflict
           again, forever. */}
-      <button onClick={() => onEdit(record)} disabled={busy || isConflict}>
+      <button onClick={() => onEdit(record)} disabled={busy || locked}>
         Edit
       </button>{" "}
-      <button onClick={() => onDelete(record)} disabled={busy || isConflict}>
+      <button onClick={() => onDelete(record)} disabled={busy || locked}>
         Delete
       </button>
       {isConflict && (
         <span style={styles.muted}>
           {" "}
           · locked until this is resolved
+        </span>
+      )}
+      {heldForOtherEditor && (
+        <span style={styles.muted}>
+          {" "}
+          · locked: {record.updatedByName ?? "someone else"} changed this on this
+          phone and has not synced yet
         </span>
       )}
     </li>
@@ -497,12 +542,12 @@ function lastSyncedLabel(serverSyncedAt) {
 }
 
 /**
- * Another worker's unsent records, reported separately from the current user's.
+ * Another person's unsent changes, reported separately from the current user's.
  *
  * Kept apart from the "waiting to sync" count rather than folded into it,
  * because they are not the same fact and do not have the same remedy. The
- * signed-in worker cannot send these — the sync engine will not push another
- * user's rows under this user's token, which is correct — so a single combined
+ * signed-in worker cannot send these — the sync engine pushes a change only
+ * under the token of whoever made it, which is correct — so a single combined
  * number would tell them to press a button that will never clear it.
  *
  * Without this line the phone reads "0 waiting to sync" over a database holding
@@ -522,14 +567,22 @@ function OtherWorkerNotice({ deviceCounts }) {
   return (
     <p style={styles.notice("warn")}>
       <strong>
-        {others} {one ? "record" : "records"} captured by{" "}
+        {others} {one ? "record" : "records"} changed by{" "}
         {otherWorkers === 1 ? "another worker" : `${otherWorkers} other workers`}{" "}
         {one ? "is" : "are"} also on this phone, still unsent.
       </strong>{" "}
-      Only the worker who collected {them} can sync {them}, after signing in
+      Only the person who made those changes can sync {them}, after signing in
       here. Do not wipe or hand on this phone until {theyHave} synced.
     </p>
   );
+}
+
+// Says whose records the list holds, because it is no longer always "yours".
+function listHeading(user, count) {
+  if (seesWholeOrganisation(user)) return `Records in your organisation (${count})`;
+  if (user?.areaName) return `Records in ${user.areaName} (${count})`;
+  // A worker with no area sees only what they captured themselves.
+  return `Your records (${count})`;
 }
 
 function SyncNotice({ summary }) {
@@ -542,6 +595,15 @@ function SyncNotice({ summary }) {
         connection, so it has no session with the server yet. Your records are
         safe and still waiting — sign out and sign in again with your password
         while you have signal, then sync.
+      </p>
+    );
+  }
+
+  if (summary.scopeChanged) {
+    return (
+      <p style={styles.notice("warn")}>
+        Your area or role was changed while this sync was running. Nothing was
+        lost — press <strong>Sync now</strong> again to load your new records.
       </p>
     );
   }
@@ -605,6 +667,7 @@ export default function CaptureScreen() {
   const [pending, setPending] = useState(0);
   const [lastSyncAt, setLastSyncAt] = useState(null);
   const [deviceCounts, setDeviceCounts] = useState(null);
+  const [user, setUser] = useState(null);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -612,23 +675,25 @@ export default function CaptureScreen() {
   const [expandedId, setExpandedId] = useState(null);
 
   const refresh = useCallback(async () => {
-    const { rows, pendingCount, lastSyncAt: at, deviceCounts: counts } =
+    const { rows, pendingCount, lastSyncAt: at, deviceCounts: counts, user: current } =
       await loadRecords();
     setRecords(rows);
     setPending(pendingCount);
     setLastSyncAt(at);
     setDeviceCounts(counts);
+    setUser(current);
   }, []);
 
   useEffect(() => {
     let cancelled = false;
     loadRecords()
-      .then(({ rows, pendingCount, lastSyncAt: at, deviceCounts: counts }) => {
+      .then(({ rows, pendingCount, lastSyncAt: at, deviceCounts: counts, user: current }) => {
         if (cancelled) return;
         setRecords(rows);
         setPending(pendingCount);
         setLastSyncAt(at);
         setDeviceCounts(counts);
+        setUser(current);
       })
       .catch((err) => {
         if (!cancelled) setError(`Could not read local records: ${err.message}`);
@@ -785,7 +850,7 @@ export default function CaptureScreen() {
         editing={Boolean(editingId)}
       />
 
-      <h3>Records ({records.length})</h3>
+      <h3>{listHeading(user, records.length)}</h3>
       {records.length === 0 ? (
         <p style={styles.muted}>Nothing captured yet.</p>
       ) : (
@@ -794,6 +859,7 @@ export default function CaptureScreen() {
             <RecordRow
               key={record.id}
               record={record}
+              user={user}
               onEdit={handleEdit}
               onDelete={handleDelete}
               onDismiss={handleDismissNotice}

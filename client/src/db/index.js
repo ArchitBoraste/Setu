@@ -143,6 +143,37 @@ db.version(6).upgrade((tx) =>
     })
 );
 
+// Version 7 separates who may SEE a row from who must SEND a change to it (see
+// records/scope.js), so the two createdBy indexes are replaced:
+//
+//   [organizationId+localUpdatedAt]  the list, newest first. A supervisor sees
+//       every organisation row on the device, and a field worker's narrower
+//       scope is filtered in JS from the same range — a phone only ever holds
+//       what its users pulled, so the range is already small.
+//   [lastEditedBy+syncState]  the push queue and the pending count. Keyed on
+//       whoever made the unsent change, because that is whose token must carry
+//       it; createdBy would strand a supervisor's edit to a worker's record.
+//
+// The createdBy indexes are dropped rather than kept: nothing reads them now,
+// and every index is one more structure IndexedDB rewrites on each save.
+//
+// The backfill sets lastEditedBy = createdBy on every existing row. That is
+// exact, not a guess: before this version the device refused any edit by
+// someone other than the creator, so every local change on a phone today was
+// made by the person who created the row.
+db.version(7)
+  .stores({
+    records: "id, [organizationId+localUpdatedAt], [lastEditedBy+syncState]",
+  })
+  .upgrade((tx) =>
+    tx
+      .table("records")
+      .toCollection()
+      .modify((row) => {
+        row.lastEditedBy ??= row.createdBy;
+      })
+  );
+
 // Fired when another tab running newer code wants to upgrade the schema. Until
 // this tab closes the database, that upgrade is blocked and the new tab hangs on
 // an unopened database. Closing here unblocks it; this tab's own queries then

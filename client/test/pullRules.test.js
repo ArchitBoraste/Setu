@@ -6,7 +6,10 @@ import {
   RESOLUTION_ACTION,
   classifyPulledRow,
   classifyResolution,
+  pulledMetadataPatch,
+  readCursor,
   releaseLegacyDeletionLock,
+  windowStart,
 } from "../src/sync/pullRules.js";
 
 const RECORD_ID = "3d2c1b0a-9f8e-4d7c-b6a5-4f3e2d1c0b9a";
@@ -397,5 +400,96 @@ describe("releaseLegacyDeletionLock", () => {
       syncError: { reason: "invalid_payload", message: "memberCount", at: 1 },
     });
     assert.equal(releaseLegacyDeletionLock(trapped), SYNC_STATE.REJECTED);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The cursor and the scope it was advanced in
+// ---------------------------------------------------------------------------
+
+const WADGAON_SCOPE = "area:2c3d4e5f-6071-4b8c-9d0e-1f2a3b4c5d6e";
+const SHIRUR_SCOPE = "area:8d9e0f1a-2b3c-4d5e-8f6a-7b8c9d0e1f2a";
+const CURSOR_AT = "2026-09-22 15:10:00.000000";
+
+describe("readCursor", () => {
+  test("a cursor stamped with its scope is read back whole", () => {
+    assert.deepEqual(readCursor({ until: CURSOR_AT, scope: WADGAON_SCOPE }), {
+      until: CURSOR_AT,
+      scope: WADGAON_SCOPE,
+    });
+  });
+
+  // A bare string names no scope, so no scope can vouch for it: one full pull.
+  test("a cursor from before scopes existed reads as no cursor at all", () => {
+    assert.equal(readCursor(CURSOR_AT), null);
+  });
+
+  test("nothing stored, or half a cursor, reads as no cursor", () => {
+    for (const value of [null, undefined, {}, { until: CURSOR_AT }, { scope: WADGAON_SCOPE }]) {
+      assert.equal(readCursor(value), null, JSON.stringify(value));
+    }
+  });
+});
+
+describe("windowStart", () => {
+  test("the cursor stands when the server served the scope it was advanced in", () => {
+    const cursor = { until: CURSOR_AT, scope: WADGAON_SCOPE };
+    assert.equal(windowStart(cursor, WADGAON_SCOPE), CURSOR_AT);
+  });
+
+  // Regression target: a worker moved to Shirur whose Wadgaon cursor was
+  // applied to Shirur would never receive Shirur's older records.
+  test("after a move to another area the window starts from the beginning", () => {
+    const cursor = { until: CURSOR_AT, scope: WADGAON_SCOPE };
+    assert.equal(windowStart(cursor, SHIRUR_SCOPE), null);
+  });
+
+  test("with no cursor the window starts from the beginning", () => {
+    assert.equal(windowStart(null, WADGAON_SCOPE), null);
+  });
+});
+
+describe("pulledMetadataPatch", () => {
+  const WADGAON = "2c3d4e5f-6071-4b8c-9d0e-1f2a3b4c5d6e";
+
+  test("fills in the area and names a row reached its version without", () => {
+    const local = localRow({ syncedVersion: 4 });
+    const remote = remoteRow({
+      areaId: WADGAON,
+      createdByName: "Field Worker A",
+      updatedByName: "Field Worker B",
+    });
+    assert.deepEqual(pulledMetadataPatch(local, remote), {
+      areaId: WADGAON,
+      createdByName: "Field Worker A",
+      updatedByName: "Field Worker B",
+    });
+  });
+
+  // A capture carries the area the device last knew; the server's is the real one.
+  test("corrects an area the device guessed", () => {
+    const local = localRow({ areaId: "8d9e0f1a-2b3c-4d5e-8f6a-7b8c9d0e1f2a" });
+    assert.deepEqual(pulledMetadataPatch(local, remoteRow({ areaId: WADGAON })), {
+      areaId: WADGAON,
+    });
+  });
+
+  test("returns nothing when the row already agrees", () => {
+    const local = localRow({ areaId: WADGAON, createdByName: "Field Worker A" });
+    const remote = remoteRow({ areaId: WADGAON, createdByName: "Field Worker A" });
+    assert.equal(pulledMetadataPatch(local, remote), null);
+  });
+
+  test("never replaces something the device knows with something the server does not", () => {
+    const local = localRow({ updatedByName: "Supervisor" });
+    assert.equal(pulledMetadataPatch(local, remoteRow({ updatedByName: null })), null);
+  });
+
+  test("never touches what the record says or how it syncs", () => {
+    const patch = pulledMetadataPatch(
+      localRow(),
+      remoteRow({ areaId: WADGAON, payload: { householdName: "Other" }, version: 9 })
+    );
+    assert.deepEqual(Object.keys(patch), ["areaId"]);
   });
 });

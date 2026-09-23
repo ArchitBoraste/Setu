@@ -342,3 +342,90 @@ export function releaseLegacyDeletionLock(local) {
   }
   return local.syncError ? SYNC_STATE.REJECTED : SYNC_STATE.PENDING;
 }
+
+// ---------------------------------------------------------------------------
+// THE CURSOR AND THE SCOPE IT WAS ADVANCED IN
+//
+// A cursor says "every row in ONE SET, changed up to here, is on this device".
+// Which set is decided by the server — the organisation for a supervisor, an
+// area for a field worker — and it can change under a device that has done
+// nothing: a worker moved to another village keeps the same user id, the same
+// phone and the same cursor. A window starting at that cursor would skip every
+// row of the new village that changed before it — silently, and for good.
+//
+// So the cursor is stored WITH the scope key it was advanced in, the device
+// sends both, and the server honours the cursor only if the key is still that
+// user's scope (sinceForScope in server/sync/pullRules.js); otherwise it reads
+// from the beginning and says which scope it served. The device then stamps the
+// new cursor with THAT key.
+//
+// Keyed like this rather than by (user, area) on the device, because the device
+// is precisely the party that does not know it was moved until the server
+// tells it. A cursor chosen by the device's idea of its own area would be the
+// stale one on exactly the sync that matters. It also covers what an area key
+// would not: a promotion to supervisor, a move between organisations, and a
+// worker with no area at all.
+//
+// One cursor per user, not one per scope. Moving back to a village worked
+// before starts that window from the beginning again rather than resuming an
+// old cursor — one full pull, in exchange for never having to argue that a
+// cursor left behind months ago is still sound.
+// ---------------------------------------------------------------------------
+
+/**
+ * The stored cursor, or null for "read from the beginning".
+ *
+ * Cursors written before scopes existed are bare strings. They name no scope,
+ * so no scope can vouch for them, and they are read as absent: one full pull,
+ * which REPLAY SAFETY above makes harmless.
+ */
+export function readCursor(value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    typeof value.until === "string" &&
+    typeof value.scope === "string"
+  ) {
+    return { until: value.until, scope: value.scope };
+  }
+  return null;
+}
+
+/**
+ * Where the window this sync read actually started, given the scope the server
+ * says it served. The device's own view of what it asked for is not enough: a
+ * cursor from another scope was ignored by the server, and the window began at
+ * the epoch.
+ */
+export function windowStart(cursor, servedScopeKey) {
+  return cursor !== null && cursor.scope === servedScopeKey ? cursor.until : null;
+}
+
+// Facts about a record only the server holds for certain, which do not change
+// what the record SAYS: its area (fixed at first insert) and the names shown
+// beside it.
+const SERVER_METADATA_FIELDS = ["areaId", "createdByName", "updatedByName"];
+
+/**
+ * What to copy from a pulled row onto a synced local row the pull otherwise
+ * SKIPS because this device already holds that version — or null.
+ *
+ * A row can reach its current version without those facts: pulled by a build
+ * from before they existed, or captured here and pushed, when the device only
+ * guessed the area. Skipping by version alone would leave those rows filed
+ * under the wrong area, and hidden from the worker they belong to, until the
+ * record next changed.
+ *
+ * Payload, version and sync state are never part of this. A value the server
+ * does not have (null) never replaces one the device has.
+ */
+export function pulledMetadataPatch(local, remote) {
+  const patch = {};
+  for (const field of SERVER_METADATA_FIELDS) {
+    const value = remote[field];
+    if (value !== null && value !== undefined && local[field] !== value) {
+      patch[field] = value;
+    }
+  }
+  return Object.keys(patch).length > 0 ? patch : null;
+}

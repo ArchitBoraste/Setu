@@ -1,7 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import { pool } from "../db/index.js";
-import { requireAuth } from "../middleware/auth.js";
+import { loadArea, requireAuth } from "../middleware/auth.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import {
   MAX_BATCH_RECORDS,
@@ -9,15 +9,18 @@ import {
   REJECT_REASON,
   canonicalJson,
   classifyPush,
+  mayWrite,
   validateEnvelope,
 } from "../sync/pushRules.js";
 import {
   PULL_COMMIT_LAG_MS,
   keysetFrom,
   resolveWindow,
+  sinceForScope,
   validatePullQuery,
   validateResolutionQuery,
 } from "../sync/pullRules.js";
+import { SCOPE_KIND, scopeFor } from "../sync/scopeRules.js";
 import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
 
 const router = express.Router();
@@ -44,6 +47,8 @@ const RECORD_COLUMNS = `
   id,
   organization_id AS organizationId,
   created_by      AS createdBy,
+  area_id         AS areaId,
+  updated_by      AS updatedBy,
   device_id       AS deviceId,
   form_type       AS formType,
   form_version    AS formVersion,
@@ -73,6 +78,8 @@ function toServerCopy(stored) {
   return {
     id: stored.id,
     createdBy: stored.createdBy,
+    areaId: stored.areaId,
+    updatedBy: stored.updatedBy,
     deviceId: stored.deviceId,
     formType: stored.formType,
     formVersion: stored.formVersion,
@@ -82,21 +89,6 @@ function toServerCopy(stored) {
     updatedAt: stored.updatedAt,
     deletedAt: stored.deletedAt,
   };
-}
-
-/**
- * May this caller write this stored row?
- *
- * Organisation and role come from the verified JWT and never from the body. The
- * client decides what to render; the server decides what is allowed.
- */
-function mayWrite(actor, stored) {
-  if (stored.organizationId !== actor.organizationId) return false;
-  // A field worker pushes their own captures and nothing else. Phones are shared
-  // and a stolen token is a real thing, so ownership is re-checked per row
-  // rather than assumed from the fact that the row reached this device.
-  if (actor.role === "field_worker") return stored.createdBy === actor.id;
-  return true;
 }
 
 /**
@@ -220,7 +212,7 @@ async function applyOne(conn, actor, incoming) {
 
     if (stored && !mayWrite(actor, stored)) {
       await conn.rollback();
-      // One code for "another organisation's row" and "another worker's row".
+      // One code for "another organisation's row" and "another area's row".
       // Which of the two it is, is itself none of this caller's business.
       return rejected(
         incoming.id,
@@ -278,6 +270,7 @@ async function applyOne(conn, actor, incoming) {
         // provisional, device-clock tombstone date until the server answers with
         // the real one, and a replay is an answer like any other.
         deletedAt: stored.deletedAt,
+        areaId: stored.areaId,
         replayed: true,
       };
     }
@@ -295,17 +288,27 @@ async function applyOne(conn, actor, incoming) {
     // a row that arrives already deleted is dated now.
     const deletedAt = incoming.deleted ? (stored?.deletedAt ?? serverNow) : null;
 
+    // The record's area: fixed once, here, and never touched by a later push. A
+    // household does not change village because a different worker edited it.
+    const areaId = stored ? stored.areaId : actor.areaId;
+
     if (verdict.outcome === PUSH_OUTCOME.INSERT) {
       await conn.query(
         `INSERT INTO records
-           (id, organization_id, created_by, device_id, form_type, form_version,
-            payload, version, created_at, updated_at, deleted_at)
-         VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?)`,
+           (id, organization_id, created_by, area_id, updated_by, device_id,
+            form_type, form_version, payload, version, created_at, updated_at,
+            deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON), ?, ?, ?, ?)`,
         [
           incoming.id,
           // Organisation and owner come from the verified token. A body may name
           // any user it likes; it is simply not read here.
           actor.organizationId,
+          actor.id,
+          // The capturing user's area as the database holds it on THIS request
+          // (see loadArea), not whatever the device believed when it captured
+          // offline. NULL for a user with no area.
+          actor.areaId,
           actor.id,
           incoming.deviceId,
           incoming.formType,
@@ -337,13 +340,18 @@ async function applyOne(conn, actor, incoming) {
         // nothing failing to show it. Setting it here also makes the timestamp
         // returned to the device exactly the one stored, rather than a value
         // read back and hoped to match.
+        //
+        // updated_by is the verified caller: whose change this version is. It is
+        // what lets every device say who last changed a household's record, now
+        // that it need not be the person who captured it.
         `UPDATE records
-            SET device_id = ?, form_type = ?, form_version = ?,
+            SET device_id = ?, updated_by = ?, form_type = ?, form_version = ?,
                 payload = CAST(? AS JSON), version = ?,
                 deleted_at = ?, updated_at = ?
           WHERE id = ?`,
         [
           incoming.deviceId,
+          actor.id,
           incoming.formType,
           incoming.formVersion,
           incoming.payloadText,
@@ -370,6 +378,10 @@ async function applyOne(conn, actor, incoming) {
       // until the first successful push and is then replaced, instead of staying
       // on the device forever as the row's permanent answer.
       deletedAt,
+      // The same for the area. A capture made offline carries the area the
+      // device last knew; the server set the real one just now, and the device
+      // should not have to wait for a pull to learn it.
+      areaId,
     };
   } catch (error) {
     await conn.rollback();
@@ -418,6 +430,7 @@ async function pushOne(conn, actor, item) {
 router.post(
   "/push",
   requireAuth,
+  loadArea,
   asyncHandler(async (req, res) => {
     const batch = req.body?.records;
 
@@ -458,17 +471,37 @@ router.post(
 // What a device receives. organization_id is deliberately absent: the device
 // belongs to exactly one organisation and already knows which, so sending it
 // back is one more field on a phone that can be lost.
+//
+// The creator's and last editor's names ride along so a shared list can say
+// whose household visit each row is and who changed it last. A device cannot
+// look them up itself: it holds exactly one user, the person signed in on it.
+//
+// areaId is sent, unlike organization_id, because the device needs it to decide
+// what to SHOW: a phone shared by workers from two villages holds both
+// villages' rows, and each worker may be shown only their own.
 const PULL_COLUMNS = `
-  id,
-  created_by   AS createdBy,
-  device_id    AS deviceId,
-  form_type    AS formType,
-  form_version AS formVersion,
-  payload,
-  version,
-  DATE_FORMAT(created_at, '${SERVER_TIME_FORMAT}') AS createdAt,
-  DATE_FORMAT(updated_at, '${SERVER_TIME_FORMAT}') AS updatedAt,
-  DATE_FORMAT(deleted_at, '${SERVER_TIME_FORMAT}') AS deletedAt`;
+  r.id,
+  r.created_by   AS createdBy,
+  cu.full_name   AS createdByName,
+  r.updated_by   AS updatedBy,
+  uu.full_name   AS updatedByName,
+  r.area_id      AS areaId,
+  r.device_id    AS deviceId,
+  r.form_type    AS formType,
+  r.form_version AS formVersion,
+  r.payload,
+  r.version,
+  DATE_FORMAT(r.created_at, '${SERVER_TIME_FORMAT}') AS createdAt,
+  DATE_FORMAT(r.updated_at, '${SERVER_TIME_FORMAT}') AS updatedAt,
+  DATE_FORMAT(r.deleted_at, '${SERVER_TIME_FORMAT}') AS deletedAt`;
+
+// Every column is qualified with r. below: users has its own id and updated_at,
+// and an unqualified one in the window would be ambiguous. The editor join is
+// LEFT because updated_by is NULL on rows written before migration 004.
+const PULL_FROM = `
+    FROM records r
+    JOIN users cu ON cu.id = r.created_by
+    LEFT JOIN users uu ON uu.id = r.updated_by`;
 
 // The window and the keyset, identical in both queries below.
 //
@@ -494,9 +527,9 @@ const PULL_COLUMNS = `
 // is gone: a row that merely stops appearing reads as "no change", and the
 // device keeps its copy and pushes it back.
 const PULL_WINDOW = `
-     updated_at >  ?
- AND updated_at <= ?
- AND (updated_at > ? OR (updated_at = ? AND id > ?))`;
+     r.updated_at >  ?
+ AND r.updated_at <= ?
+ AND (r.updated_at > ? OR (r.updated_at = ? AND r.id > ?))`;
 
 // ORDER BY both columns, and paginate by keyset rather than OFFSET.
 //
@@ -515,45 +548,81 @@ const PULL_WINDOW = `
 // (timestamp, id)" cannot skip anything, because it names a position in the data
 // instead of a count of rows someone else can change. It also stays fast at any
 // depth, where OFFSET 50000 makes MySQL walk and discard fifty thousand rows.
-const PULL_ORDER = `ORDER BY updated_at ASC, id ASC LIMIT ?`;
+const PULL_ORDER = `ORDER BY r.updated_at ASC, r.id ASC LIMIT ?`;
 
-// A field worker pulls only what they captured. A supervisor pulls the
-// organisation.
+// A field worker pulls their area — plus any record with no area that they
+// captured themselves. A supervisor pulls the organisation. This is the rule in
+// sync/scopeRules.js, written as a WHERE clause.
 //
 // This is a containment boundary, not a convenience. A field phone is the most
 // losable object in the system — pockets, buses, rivers — and the scoping means
-// the worst case for one is one worker's own households, not an organisation's
-// entire register. The role is read from the verified JWT, never from anything
-// the request carries, so a device cannot widen its own blast radius by asking.
-const PULL_OWN_RECORDS = `
+// the worst case for one is one village's households, not an organisation's
+// entire register. The role is read from the verified JWT and the area from the
+// database on this request, never from anything the request carries, so a
+// device cannot widen its own blast radius by asking.
+//
+// For a worker with no area the first disjunct binds NULL, which matches
+// nothing, and the pull is exactly their own unassigned captures.
+//
+// The OR costs this statement a clean single-index plan: MySQL answers it from
+// the (organization_id, area_id, updated_at) and (created_by, updated_at) keys
+// and sorts the union. At a village's size that sort is small; if an area grows
+// to tens of thousands of rows, split this into a UNION ALL of two ordered,
+// limited halves.
+const PULL_AREA = `
   SELECT ${PULL_COLUMNS}
-    FROM records
-   WHERE organization_id = ?
-     AND created_by = ?
+   ${PULL_FROM}
+   WHERE r.organization_id = ?
+     AND (r.area_id = ? OR (r.area_id IS NULL AND r.created_by = ?))
      AND ${PULL_WINDOW}
    ${PULL_ORDER}`;
 
 const PULL_ORGANIZATION = `
   SELECT ${PULL_COLUMNS}
-    FROM records
-   WHERE organization_id = ?
+   ${PULL_FROM}
+   WHERE r.organization_id = ?
      AND ${PULL_WINDOW}
    ${PULL_ORDER}`;
+
+/**
+ * What a device is told about the scope it was just served.
+ *
+ * `key` is what it stamps its cursor with and sends back next time (see
+ * sinceForScope). The area is how a phone learns it was moved: the list is
+ * filtered by it, and a phone told only at sign-in would keep showing the old
+ * village until somebody signed out.
+ */
+function scopeView(actor, scope) {
+  return {
+    key: scope.key,
+    areaId: actor.areaId ?? null,
+    areaName: actor.areaName ?? null,
+  };
+}
 
 /**
  * Everything in scope that changed inside one closed time window.
  *
  * A first sync sends no cursor, which makes the window (epoch, now] — the whole
  * dataset — so the response is paginated and the client walks it page by page.
+ * So does a cursor stamped with a scope the caller is no longer in.
  */
 router.get(
   "/pull",
   requireAuth,
+  loadArea,
   asyncHandler(async (req, res) => {
     const parsed = validatePullQuery(req.query);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
 
-    const { since, requestedUntil, afterUpdatedAt, afterId, pageSize } = parsed.value;
+    const { requestedUntil, afterUpdatedAt, afterId, pageSize, requestedScope } =
+      parsed.value;
+    const scope = scopeFor(req.user);
+    const since = sinceForScope({
+      since: parsed.value.since,
+      requestedScope,
+      scopeKey: scope.key,
+    });
 
     // BEFORE the rows are selected, never after. Reading the clock afterwards
     // would hand back an edge later than the snapshot the query actually saw,
@@ -577,19 +646,19 @@ router.get(
     // work and could disagree with the page it describes.
     const probeSize = pageSize + 1;
 
-    // Two complete statements chosen by role, rather than one assembled from
-    // fragments. Both are fully parameterised, and each keeps a WHERE clause the
-    // matching index can actually drive.
+    // Two complete statements chosen by scope, rather than one assembled from
+    // fragments. Both are fully parameterised.
     const [rows] =
-      req.user.role === "field_worker"
-        ? await pool.query(PULL_OWN_RECORDS, [
+      scope.kind === SCOPE_KIND.ORGANISATION
+        ? await pool.query(PULL_ORGANIZATION, [
             req.user.organizationId,
-            req.user.id,
             ...windowParams,
             probeSize,
           ])
-        : await pool.query(PULL_ORGANIZATION, [
+        : await pool.query(PULL_AREA, [
             req.user.organizationId,
+            req.user.areaId,
+            req.user.id,
             ...windowParams,
             probeSize,
           ]);
@@ -604,6 +673,7 @@ router.get(
       // every following page so one sync reads one fixed interval, and stores it
       // as the next cursor only once the last page has been applied.
       serverTime: until,
+      scope: scopeView(req.user, scope),
       hasMore,
       nextCursor: hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null,
     });
@@ -629,17 +699,32 @@ router.get(
 // one, so a device can rejoin normal operation from a single response whether or
 // not the record itself moved.
 //
-// SCOPE: conflicts this caller raised, plus conflicts about records this caller
-// captured. The first is the device waiting to be unstuck. The second is the
-// worker who walked to that household and whose record a supervisor has just
-// changed underneath them — a record that silently becomes something else is
-// exactly what this is here to prevent.
+// SCOPE, for a field worker: every settled conflict about a record they can
+// see — their area, plus their own unassigned captures. Exactly the pull's
+// scope, so the feed can never hand a phone a record (and resolutions carry the
+// whole record) that its pull would not.
 //
-// That scope needs no role branch, unlike the pull above. A field worker can
-// only ever have submitted a conflict about their own record — mayWrite() on the
-// push path refuses anything else before fileConflict() is ever reached — so
-// both disjuncts collapse to "my own records" for them, and neither can widen
-// what a lost phone gives up.
+// That is wider than "conflicts I raised or records I captured", which is what
+// this used to be, and it has to be. Workers now change each other's records:
+//
+//   the worker whose version a supervisor just overrode may be neither the one
+//   who raised the conflict nor the one who captured the household. Their
+//   device holds the replaced version, and a record silently becoming
+//   something else on it is exactly what this feed is here to prevent.
+//
+//   on a phone shared within a village, the row locked by one worker's
+//   conflict is unlocked by the next worker's sync, instead of staying locked
+//   until the first one comes back.
+//
+// The device decides what each resolution means for it (classifyResolution in
+// client/src/sync/pullRules.js): only its own dispute is adopted, and a notice
+// is raised only where the phone held the version that was replaced. A
+// resolution about a row a phone never held, or has moved past, is skipped.
+//
+// For a supervisor or admin: conflicts they raised, plus conflicts about
+// records they captured — unchanged. Their pull is the whole organisation, and
+// every resolution in it would be a stream of notices about decisions their own
+// role makes.
 // ---------------------------------------------------------------------------
 
 const RESOLUTION_COLUMNS = `
@@ -661,6 +746,10 @@ const RESOLUTION_COLUMNS = `
   rc.superseded_form_version AS supersededFormVersion,
   rc.superseded_payload      AS supersededPayload,
   r.created_by   AS createdBy,
+  cu.full_name   AS createdByName,
+  r.updated_by   AS updatedBy,
+  uu.full_name   AS updatedByName,
+  r.area_id      AS areaId,
   r.device_id    AS deviceId,
   r.form_type    AS formType,
   r.form_version AS formVersion,
@@ -674,19 +763,38 @@ const RESOLUTION_COLUMNS = `
 // exclusive lower edge, inclusive upper edge so consecutive windows tile, and
 // (resolved_at, id) because one supervisor closing several conflicts in a
 // millisecond is ordinary, not exotic.
-const RESOLUTIONS_PAGE = `
-  SELECT ${RESOLUTION_COLUMNS}
+const RESOLUTIONS_FROM = `
     FROM record_conflicts rc
     JOIN records r ON r.id = rc.record_id
-    LEFT JOIN users ru ON ru.id = rc.resolved_by
-   WHERE rc.organization_id = ?
-     AND rc.status = 'resolved'
-     AND (rc.submitted_by = ? OR r.created_by = ?)
+    JOIN users cu ON cu.id = r.created_by
+    LEFT JOIN users uu ON uu.id = r.updated_by
+    LEFT JOIN users ru ON ru.id = rc.resolved_by`;
+
+const RESOLUTIONS_WINDOW = `
      AND rc.resolved_at >  ?
      AND rc.resolved_at <= ?
      AND (rc.resolved_at > ? OR (rc.resolved_at = ? AND rc.id > ?))
    ORDER BY rc.resolved_at ASC, rc.id ASC
    LIMIT ?`;
+
+// Supervisors and admins: what they raised, or what they captured.
+const RESOLUTIONS_OWN_STAKE = `
+  SELECT ${RESOLUTION_COLUMNS}
+   ${RESOLUTIONS_FROM}
+   WHERE rc.organization_id = ?
+     AND rc.status = 'resolved'
+     AND (rc.submitted_by = ? OR r.created_by = ?)
+   ${RESOLUTIONS_WINDOW}`;
+
+// Field workers: every record their pull would give them. The same predicate
+// as PULL_AREA, so the two can only ever widen together.
+const RESOLUTIONS_AREA = `
+  SELECT ${RESOLUTION_COLUMNS}
+   ${RESOLUTIONS_FROM}
+   WHERE rc.organization_id = ?
+     AND rc.status = 'resolved'
+     AND (r.area_id = ? OR (r.area_id IS NULL AND r.created_by = ?))
+   ${RESOLUTIONS_WINDOW}`;
 
 /** One settled disagreement, plus what the record says now. */
 function toResolutionView(row) {
@@ -723,15 +831,13 @@ function toResolutionView(row) {
     // What the record said immediately before this resolution replaced it.
     //
     // This is the copy that used to be destroyed. It belonged to whoever wrote
-    // the version the supervisor overrode — for a field worker's record, almost
-    // always the worker who captured it, because mayWrite() lets no other field
-    // worker's phone push it; only a supervisor's can. By the time this reaches
-    // their device, the record pull earlier in the same sync has already
-    // overwritten their local copy, so the device cannot keep it itself; the
-    // server has to hand it back.
+    // the version the supervisor overrode — any worker in the record's area, or
+    // a supervisor. By the time this reaches their device, the record pull may
+    // already have overwritten their local copy, so the device cannot keep it
+    // itself; the server has to hand it back.
     //
-    // It travels under the scope this feed already has — conflicts you raised,
-    // or about records you captured — and no wider. A device with no stake in
+    // It travels under the scope this feed already has — for a field worker,
+    // records their own pull delivers — and no wider. A device that cannot see
     // the record never receives a resolution for it, so it never receives the
     // replaced answers either. Null for kept_server, and for resolutions made
     // before migration 002, whose replaced version was not kept.
@@ -750,6 +856,10 @@ function toResolutionView(row) {
     record: {
       id: row.recordId,
       createdBy: row.createdBy,
+      createdByName: row.createdByName,
+      updatedBy: row.updatedBy,
+      updatedByName: row.updatedByName,
+      areaId: row.areaId,
       deviceId: row.deviceId,
       formType: row.formType,
       formVersion: row.formVersion,
@@ -765,11 +875,21 @@ function toResolutionView(row) {
 router.get(
   "/resolutions",
   requireAuth,
+  loadArea,
   asyncHandler(async (req, res) => {
     const parsed = validateResolutionQuery(req.query);
     if (parsed.error) return res.status(400).json({ error: parsed.error });
 
-    const { since, requestedUntil, afterResolvedAt, afterId, pageSize } = parsed.value;
+    const { requestedUntil, afterResolvedAt, afterId, pageSize, requestedScope } =
+      parsed.value;
+    // The same scope check as the pull: both halves share one cursor, so a
+    // cursor from another scope restarts both from the beginning.
+    const scope = scopeFor(req.user);
+    const since = sinceForScope({
+      since: parsed.value.since,
+      requestedScope,
+      scopeKey: scope.key,
+    });
 
     // Read before the rows are selected and held behind the clock, for the same
     // reason the pull does it — see PULL_COMMIT_LAG_MS. A resolution commits
@@ -790,17 +910,29 @@ router.get(
       afterId,
     });
 
-    const [rows] = await pool.query(RESOLUTIONS_PAGE, [
-      req.user.organizationId,
-      req.user.id,
-      req.user.id,
+    const windowParams = [
       from,
       until,
       keyset.updatedAt,
       keyset.updatedAt,
       keyset.id,
       pageSize + 1,
-    ]);
+    ];
+
+    const [rows] =
+      scope.kind === SCOPE_KIND.ORGANISATION
+        ? await pool.query(RESOLUTIONS_OWN_STAKE, [
+            req.user.organizationId,
+            req.user.id,
+            req.user.id,
+            ...windowParams,
+          ])
+        : await pool.query(RESOLUTIONS_AREA, [
+            req.user.organizationId,
+            req.user.areaId,
+            req.user.id,
+            ...windowParams,
+          ]);
 
     const hasMore = rows.length > pageSize;
     const page = hasMore ? rows.slice(0, pageSize) : rows;
@@ -809,6 +941,7 @@ router.get(
     res.json({
       resolutions: page.map(toResolutionView),
       serverTime: until,
+      scope: scopeView(req.user, scope),
       hasMore,
       nextCursor:
         hasMore && last ? { resolvedAt: last.resolvedAt, id: last.conflictId } : null,

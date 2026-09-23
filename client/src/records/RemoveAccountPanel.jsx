@@ -80,11 +80,13 @@ function LossWarning({ counts }) {
         in that list would have to be collected again.
       </p>
 
+      {/* Split by who made each unsent change, not who first captured the
+          record: "yours" has to be exactly what your own Sync can send. */}
       {counts.mine > 0 && counts.others > 0 && (
         <ul style={styles.list}>
-          <li>{plural(counts.mine, "record", "records")} captured by you</li>
+          <li>{plural(counts.mine, "record", "records")} changed by you</li>
           <li>
-            {plural(counts.others, "record", "records")} captured by{" "}
+            {plural(counts.others, "record", "records")} changed by{" "}
             {counts.otherWorkers === 1
               ? "another worker"
               : `${counts.otherWorkers} other workers`}{" "}
@@ -95,17 +97,17 @@ function LossWarning({ counts }) {
 
       {counts.mine > 0 && (
         <p style={styles.muted}>
-          To keep your own records: cancel, press <strong>Sync now</strong>, and
+          To keep your own changes: cancel, press <strong>Sync now</strong>, and
           wait until the waiting count reaches zero.
         </p>
       )}
 
       {counts.others > 0 && (
         <p style={styles.muted}>
-          The {plural(counts.others, "record", "records")} captured by someone
+          The {plural(counts.others, "record", "records")} changed by someone
           else <strong>cannot be synced by you</strong> — only by the worker who
-          collected {counts.others === 1 ? "it" : "them"}, after they sign in on
-          this phone. Removing the account now destroys{" "}
+          made {counts.others === 1 ? "that change" : "those changes"}, after they
+          sign in on this phone. Removing the account now destroys{" "}
           {counts.others === 1 ? "it" : "them"} without that worker ever knowing.
         </p>
       )}

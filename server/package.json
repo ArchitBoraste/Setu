@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
+    "seed": "node db/seed.js",
+    "demo:reset": "node db/demoReset.js",
     "test": "node --test \"test/**/*.test.js\""
   },
   "dependencies": {

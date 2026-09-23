@@ -4,6 +4,8 @@
 // the delta window wrong does not throw, it silently stops delivering records,
 // and a bug that quiet has to be testable without a database.
 
+import { isScopeKey } from "./scopeRules.js";
+
 export const DEFAULT_PULL_LIMIT = 100;
 export const MAX_PULL_LIMIT = 500;
 
@@ -102,6 +104,41 @@ export function resolveWindow(since, requestedUntil, safeNow) {
 }
 
 /**
+ * The lower edge a pull may honour, given the scope its cursor was advanced in.
+ *
+ * A cursor means "every row in ONE SET, changed up to here, is on this device".
+ * It says nothing about any other set. When a worker is moved to another
+ * village, the rows of the new one changed long before the cursor was last
+ * moved, and a window starting at that cursor would never deliver them —
+ * silently, and for good, because nothing re-offers what falls below a cursor.
+ *
+ * So the device sends back the scope key its cursor was stamped with, and the
+ * cursor is honoured only if that is still this user's scope. Anything else — a
+ * different area, a different role, a cursor from a build that did not stamp
+ * one — starts the window from the beginning. A full replay is harmless on both
+ * halves of the sync (see REPLAY SAFETY in client/src/sync/pullRules.js); a
+ * window that skips rows is not.
+ *
+ * The comparison is made HERE, against scope read fresh from the database,
+ * rather than trusted to the device. A phone does not learn it was moved until
+ * the server tells it, and the first sync after a move is exactly when its
+ * idea of its own scope is out of date.
+ */
+export function sinceForScope({ since, requestedScope, scopeKey }) {
+  return requestedScope === scopeKey ? since : EPOCH_CURSOR;
+}
+
+// The scope a cursor was stamped with, as a device sends it back. Absent is
+// allowed — a first sync, or an older build — and simply matches nothing.
+function parseScope(scope) {
+  if (scope === undefined) return { value: null };
+  if (!isScopeKey(scope)) {
+    return { error: "scope must be a scope key previously returned by /pull" };
+  }
+  return { value: scope };
+}
+
+/**
  * Validates the query string and returns the values the route will bind.
  *
  * Every timestamp here was minted by this server and handed to the device as an
@@ -112,7 +149,7 @@ export function resolveWindow(since, requestedUntil, safeNow) {
 export function validatePullQuery(query) {
   const fail = (message) => ({ error: message });
 
-  const { since, until, afterUpdatedAt, afterId, limit } = query ?? {};
+  const { since, until, afterUpdatedAt, afterId, limit, scope } = query ?? {};
 
   if (since !== undefined && !isServerTime(since)) {
     return fail("since must be a server timestamp previously returned by /pull");
@@ -120,6 +157,8 @@ export function validatePullQuery(query) {
   if (until !== undefined && !isServerTime(until)) {
     return fail("until must be a server timestamp previously returned by /pull");
   }
+  const requestedScope = parseScope(scope);
+  if (requestedScope.error) return fail(requestedScope.error);
 
   // The keyset position is two values that only mean anything together. Half of
   // one would silently restart the page sequence at the top of the window and
@@ -145,6 +184,7 @@ export function validatePullQuery(query) {
       afterUpdatedAt: hasAfter ? afterUpdatedAt : null,
       afterId: hasAfter ? afterId : null,
       pageSize,
+      requestedScope: requestedScope.value,
     },
   };
 }
@@ -166,7 +206,7 @@ export function validatePullQuery(query) {
 export function validateResolutionQuery(query) {
   const fail = (message) => ({ error: message });
 
-  const { since, until, afterResolvedAt, afterId, limit } = query ?? {};
+  const { since, until, afterResolvedAt, afterId, limit, scope } = query ?? {};
 
   if (since !== undefined && !isServerTime(since)) {
     return fail("since must be a server timestamp previously returned by /pull");
@@ -174,6 +214,8 @@ export function validateResolutionQuery(query) {
   if (until !== undefined && !isServerTime(until)) {
     return fail("until must be a server timestamp previously returned by /pull");
   }
+  const requestedScope = parseScope(scope);
+  if (requestedScope.error) return fail(requestedScope.error);
 
   const hasAfter = afterResolvedAt !== undefined || afterId !== undefined;
   if (hasAfter) {
@@ -195,6 +237,7 @@ export function validateResolutionQuery(query) {
       afterResolvedAt: hasAfter ? afterResolvedAt : null,
       afterId: hasAfter ? afterId : null,
       pageSize: page.value,
+      requestedScope: requestedScope.value,
     },
   };
 }

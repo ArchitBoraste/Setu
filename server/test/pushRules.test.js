@@ -11,6 +11,7 @@ import {
   RESOLVED_DEVICE_ID,
   canonicalJson,
   classifyPush,
+  mayWrite,
   validateEnvelope,
   validatePayload,
 } from "../sync/pushRules.js";
@@ -612,5 +613,89 @@ describe("validatePayload: Devanagari answers and the byte limit", () => {
     const result = validatePayload("unknown_form", 1, answers);
     assert.equal(result.error?.reason, REJECT_REASON.TOO_LARGE);
     assert.match(result.error.message, /bytes/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mayWrite — who may change a row the server already holds
+// ---------------------------------------------------------------------------
+
+const ORG = "1b2c3d4e-5f60-4a7b-8c9d-0e1f2a3b4c5d";
+const OTHER_ORG = "9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d";
+const WORKER_A = "5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c";
+const WORKER_B = "6f5e4d3c-2b1a-4f9e-8d7c-5b4a3f2e1d0c";
+const SUPERVISOR = "7a6b5c4d-3e2f-4a1b-9c8d-7e6f5a4b3c2d";
+const WADGAON = "2c3d4e5f-6071-4b8c-9d0e-1f2a3b4c5d6e";
+const SHIRUR = "8d9e0f1a-2b3c-4d5e-8f6a-7b8c9d0e1f2a";
+
+// Built the way the route builds it: identity and role from the verified JWT,
+// area from a fresh read of users.area_id.
+function actor(overrides = {}) {
+  return {
+    id: WORKER_A,
+    role: "field_worker",
+    organizationId: ORG,
+    areaId: WADGAON,
+    ...overrides,
+  };
+}
+
+function heldRow(overrides = {}) {
+  return { organizationId: ORG, createdBy: WORKER_A, areaId: WADGAON, ...overrides };
+}
+
+describe("mayWrite: supervisors and admins", () => {
+  test("a supervisor may change a record a field worker captured", () => {
+    assert.equal(mayWrite(actor({ id: SUPERVISOR, role: "supervisor" }), heldRow()), true);
+  });
+
+  test("an admin may change a record a field worker captured", () => {
+    assert.equal(mayWrite(actor({ id: SUPERVISOR, role: "admin" }), heldRow()), true);
+  });
+
+  test("a supervisor may not change another organisation's record", () => {
+    const supervisor = actor({ id: SUPERVISOR, role: "supervisor" });
+    assert.equal(mayWrite(supervisor, heldRow({ organizationId: OTHER_ORG })), false);
+  });
+});
+
+describe("mayWrite: field workers share their area", () => {
+  test("a worker may change a colleague's record in their own area", () => {
+    assert.equal(mayWrite(actor({ id: WORKER_B }), heldRow()), true);
+  });
+
+  test("a worker may change their own record", () => {
+    assert.equal(mayWrite(actor(), heldRow()), true);
+  });
+
+  test("a worker may not change a record in another area, even one they captured", () => {
+    assert.equal(mayWrite(actor(), heldRow({ areaId: SHIRUR })), false);
+  });
+
+  test("a worker moved to another area loses write access to the old one on the next request", () => {
+    // Same person, same token; only the area read from the database changed.
+    assert.equal(mayWrite(actor({ areaId: SHIRUR }), heldRow()), false);
+  });
+
+  test("a record with no area may be changed by its creator and by no other worker", () => {
+    const unassigned = heldRow({ areaId: null });
+    assert.equal(mayWrite(actor(), unassigned), true);
+    assert.equal(mayWrite(actor({ id: WORKER_B }), unassigned), false);
+  });
+
+  test("a worker with no area may change their own unassigned records and nothing in an area", () => {
+    const unassignedWorker = actor({ areaId: null });
+    assert.equal(mayWrite(unassignedWorker, heldRow({ areaId: null })), true);
+    assert.equal(mayWrite(unassignedWorker, heldRow()), false);
+  });
+
+  test("a worker may not change another organisation's record", () => {
+    assert.equal(mayWrite(actor(), heldRow({ organizationId: OTHER_ORG })), false);
+  });
+
+  test("a supervisor may change a record in any area, and one with no area", () => {
+    const supervisor = actor({ id: SUPERVISOR, role: "supervisor", areaId: null });
+    assert.equal(mayWrite(supervisor, heldRow({ areaId: SHIRUR })), true);
+    assert.equal(mayWrite(supervisor, heldRow({ areaId: null })), true);
   });
 });

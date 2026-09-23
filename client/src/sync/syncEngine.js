@@ -1,5 +1,5 @@
 import { db } from "../db/index.js";
-import { getCachedUser } from "../auth/authService.js";
+import { getCachedUser, updateCachedArea } from "../auth/authService.js";
 import {
   NetworkError,
   NotAuthenticatedError,
@@ -8,12 +8,16 @@ import {
 import { getDeviceId } from "../lib/device.js";
 import { samePayload } from "../lib/payload.js";
 import { SYNC_STATE } from "../records/syncState.js";
+import { belongsToPushQueue, canSeeRecord } from "../records/scope.js";
 import {
   PULL_ACTION,
   RESOLUTION_ACTION,
   classifyPulledRow,
   classifyResolution,
+  pulledMetadataPatch,
+  readCursor,
   releaseLegacyDeletionLock,
+  windowStart,
 } from "./pullRules.js";
 
 // The only file in client/src that talks to the server about records. Capture
@@ -58,13 +62,18 @@ const PULL_PAGE_SIZE = 100;
  * ONE PER USER, NOT ONE PER PHONE.
  *
  * A cursor says "everything in MY scope up to here has been applied". Scope is
- * per user — a field worker pulls their own records, a supervisor the
- * organisation, and the resolutions feed is conflicts you raised or records you
- * captured. A single device-wide cursor let one person's sync on a shared phone
- * move it past records and resolutions that were in someone else's scope and
- * never fetched for them. Nothing re-offers what falls below a cursor, so those
- * never arrived — and a row locked waiting for its resolution stayed locked for
- * good. Keyed by user, each person's window is theirs alone.
+ * per user — a field worker pulls their area, a supervisor the organisation.
+ * A single device-wide cursor let one person's sync on a shared phone move it
+ * past records and resolutions that were in someone else's scope and never
+ * fetched for them. Nothing re-offers what falls below a cursor, so those never
+ * arrived — and a row locked waiting for its resolution stayed locked for good.
+ * Keyed by user, each person's window is theirs alone.
+ *
+ * AND STAMPED WITH THE SCOPE IT WAS ADVANCED IN. A user's scope can change
+ * under them — a worker moved to another village — and a cursor from the old
+ * one would skip the new one's older rows. The stored value is
+ * { until, scope }; see THE CURSOR AND THE SCOPE IT WAS ADVANCED IN in
+ * pullRules.js for how the server uses it and why it is not keyed by area.
  *
  * One cursor covers BOTH halves of a sync, records and resolutions, and that is
  * deliberate rather than an omission. Both are read over one closed window and
@@ -111,12 +120,21 @@ export async function getLastSyncAt() {
   return typeof row?.value === "string" ? row.value : null;
 }
 
-// Null for a user who has never synced on this phone, which pulls from the
-// beginning — exactly like a fresh install. See REPLAY SAFETY in pullRules.js
-// for why a full replay is harmless on both halves.
+// { until, scope }, or null for a user who has never synced on this phone,
+// which pulls from the beginning — exactly like a fresh install. See REPLAY
+// SAFETY in pullRules.js for why a full replay is harmless on both halves.
 async function getSyncCursor(userId) {
   const row = await db.meta.get(cursorKey(userId));
-  return typeof row?.value === "string" ? row.value : null;
+  return readCursor(row?.value ?? null);
+}
+
+// The server answered one page of a sync in a different scope from the first.
+// Someone changed this user's area or role while the sync was running.
+class ScopeChangedError extends Error {
+  constructor() {
+    super("Your assignment changed while this sync was running.");
+    this.name = "ScopeChangedError";
+  }
 }
 
 function sleep(ms) {
@@ -172,14 +190,19 @@ function toWire(row, deviceId) {
 }
 
 /**
- * One worker's unsent rows.
+ * The changes this user made that the server has not got.
  *
- * Scoped by createdBy through the compound index, never by a global scan of
- * pending rows. Phones are handed between workers, and a record captured by
- * worker A must not reach the server under worker B's token — which is not a
- * hypothetical, because B's token is the only one this device holds once B signs
- * in. Leaving A's rows pending is the correct behaviour: they are still A's work
- * and still on the device, waiting for A to sign in again.
+ * Selected by lastEditedBy — who made the change — through the compound index,
+ * never by createdBy and never by a global scan of pending rows. Once a record
+ * can be changed by someone other than the person who captured it, createdBy
+ * answers the wrong question: a supervisor's edit to worker A's record would
+ * never be pushed by the supervisor, and would be pushed under A's token the
+ * next time A signed in on the same phone — A's name on a change A never made.
+ *
+ * Phones are handed between workers, and a change made by A must not reach the
+ * server under B's token, which is the only one the device holds once B signs
+ * in. Leaving A's changes pending is the correct behaviour: they are still A's
+ * work and still on the device, waiting for A to sign in again.
  *
  * `seen` excludes rows this run has already had an answer about. A row that
  * comes back FAILED, or that the worker edited mid-flight, stays pending on
@@ -188,12 +211,16 @@ function toWire(row, deviceId) {
  */
 async function collectPendingBatch(user, seen) {
   const rows = await db.records
-    .where("[createdBy+syncState]")
+    .where("[lastEditedBy+syncState]")
     .equals([user.userId, SYNC_STATE.PENDING])
     .limit(PUSH_BATCH_SIZE + seen.size)
     .toArray();
 
-  return rows.filter((row) => !seen.has(row.id)).slice(0, PUSH_BATCH_SIZE);
+  // The index already answers the question; the predicate is the tested
+  // statement of it, applied again so the two cannot quietly disagree.
+  return rows
+    .filter((row) => !seen.has(row.id) && belongsToPushQueue(row, user))
+    .slice(0, PUSH_BATCH_SIZE);
 }
 
 /**
@@ -238,9 +265,9 @@ async function applyResults(user, sentById, results, summary) {
       if (!sent) continue;
 
       const row = await db.records.get(result.id);
-      // Gone, or the device changed hands mid-sync. Either way this is no longer
-      // a row this user may be told about.
-      if (!row || row.createdBy !== user.userId) continue;
+      // Gone, or the device changed hands mid-sync. Either way the change this
+      // answer is about is no longer this user's.
+      if (!row || row.lastEditedBy !== user.userId) continue;
 
       if (result.status === PUSH_STATUS.ACCEPTED) {
         // The server accepted the state that was SENT. If the worker edited the
@@ -266,6 +293,10 @@ async function applyResults(user, sentById, results, summary) {
           ...(row.deletedAt !== null && typeof result.deletedAt === "string"
             ? { deletedAt: result.deletedAt }
             : {}),
+          // Likewise the area: a capture carries the area this device last knew,
+          // and the server has just filed it under the real one. Null is a real
+          // answer here (a user with no area); only a missing field is not.
+          ...(result.areaId !== undefined ? { areaId: result.areaId } : {}),
         });
         summary.accepted += 1;
         continue;
@@ -368,16 +399,19 @@ async function getWithRetry(path, params) {
   }
 }
 
-function windowParams({ since, until, limit }) {
+// `since` and `scope` always travel together: the cursor and the scope it was
+// advanced in. The server ignores the one if the other is not current.
+function windowParams({ since, scope, until, limit }) {
   const params = new URLSearchParams();
   if (since) params.set("since", since);
+  if (scope) params.set("scope", scope);
   if (until) params.set("until", until);
   params.set("limit", String(limit));
   return params;
 }
 
-function pullPageWithRetry({ since, until, after, limit }) {
-  const params = windowParams({ since, until, limit });
+function pullPageWithRetry({ since, scope, until, after, limit }) {
+  const params = windowParams({ since, scope, until, limit });
   if (after) {
     params.set("afterUpdatedAt", after.updatedAt);
     params.set("afterId", after.id);
@@ -387,8 +421,8 @@ function pullPageWithRetry({ since, until, after, limit }) {
 
 // The keyset here is a position in resolved_at, not updated_at. Two feeds, two
 // parameter names, so one can never be paged with the other's cursor.
-function resolutionPageWithRetry({ since, until, after, limit }) {
-  const params = windowParams({ since, until, limit });
+function resolutionPageWithRetry({ since, scope, until, after, limit }) {
+  const params = windowParams({ since, scope, until, limit });
   if (after) {
     params.set("afterResolvedAt", after.resolvedAt);
     params.set("afterId", after.id);
@@ -409,6 +443,15 @@ function toLocalRow(remote, organizationId, previous) {
     id: remote.id,
     organizationId,
     createdBy: remote.createdBy,
+    // Display only. Null when the server did not record one, and shown as such.
+    createdByName: remote.createdByName ?? null,
+    updatedByName: remote.updatedByName ?? null,
+    // The server's last editor. Only a LOCAL write makes a row pending, and
+    // every local write sets this to whoever made it, so on a synced copy it
+    // never selects anything into a push queue.
+    lastEditedBy: remote.updatedBy ?? null,
+    // What decides who on this phone may be shown the row. See canSeeRecord.
+    areaId: remote.areaId ?? null,
     deviceId: remote.deviceId,
     formType: remote.formType,
     formVersion: remote.formVersion,
@@ -454,7 +497,14 @@ async function applyPulledPage(user, records, summary) {
       const { action } = classifyPulledRow(local ?? null, remote);
       summary.pulled += 1;
 
-      if (action === PULL_ACTION.SKIP) continue;
+      if (action === PULL_ACTION.SKIP) {
+        // Already at this version — but perhaps without its area or names,
+        // which decide who on this phone the row is shown to. See
+        // pulledMetadataPatch; nothing the record says is touched.
+        const patch = pulledMetadataPatch(local, remote);
+        if (patch) await db.records.update(remote.id, patch);
+        continue;
+      }
 
       if (action === PULL_ACTION.KEEP_LOCAL) {
         // Deliberately nothing. See pullRules.js — touching syncedVersion here
@@ -607,8 +657,10 @@ async function applyResolutions(user, resolutions, summary, deviceId) {
 
       // Re-read inside the transaction and re-checked, exactly as the push
       // results are: the request took time, and the device may have changed
-      // hands during it.
-      if (local && local.createdBy !== user.userId) continue;
+      // hands during it. By scope, not createdBy: a supervisor whose edit to a
+      // worker's record raised a conflict needs that conflict's resolution to
+      // unlock their row.
+      if (local && !canSeeRecord(local, user)) continue;
 
       const { action } = classifyResolution(local ?? null, resolution, deviceId);
 
@@ -640,29 +692,65 @@ async function applyResolutions(user, resolutions, summary, deviceId) {
   });
 }
 
+// The scope key a page says it was served in, or null.
+function servedKey(page) {
+  return typeof page?.scope?.key === "string" ? page.scope.key : null;
+}
+
+/**
+ * Takes on the area the server says this user is in now, and returns the user
+ * the rest of the sync should be applied as.
+ *
+ * Done before any row is applied, so a worker moved to another village has the
+ * new village's rows judged against the new village — and the list they see
+ * afterwards is filtered by it, without having to sign out and in again.
+ */
+async function adoptServedArea(user, served) {
+  const areaId = served.areaId ?? null;
+  const areaName = served.areaName ?? null;
+  if (areaId === user.areaId && areaName === user.areaName) return user;
+
+  await updateCachedArea(user.userId, { areaId, areaName });
+  return { ...user, areaId, areaName };
+}
+
 /**
  * Walks the resolutions feed over one closed window, and returns that window's
- * upper edge for the record pull to reuse.
+ * upper edge and the scope it was served in, for the record pull to reuse.
  *
  * It goes first, so it is the half that fixes the edge: its first page's
  * serverTime becomes `until` for every page of both feeds, and one sync reads
- * one interval across the pair.
+ * one interval across the pair. The first page's scope is likewise the scope of
+ * the whole sync; a later page served in another one means the user was moved
+ * mid-sync, and the sync stops with the cursor unmoved.
  */
-async function pullResolutions(user, summary, { since, deviceId }) {
+async function pullResolutions(user, summary, { since, scope, deviceId }) {
   let until = null;
+  let served = null;
+  let current = user;
   let after = null;
   let pages = 0;
 
   for (;;) {
     const page = await resolutionPageWithRetry({
       since,
+      scope,
       until,
       after,
       limit: PULL_PAGE_SIZE,
     });
 
-    until ??= page.serverTime;
-    await applyResolutions(user, page.resolutions ?? [], summary, deviceId);
+    if (pages === 0) {
+      until = page.serverTime ?? null;
+      served = servedKey(page) ? page.scope : null;
+      // Nothing to window or stamp a cursor with. Stop before applying anything.
+      if (!until || !served) return { until: null, served: null, user };
+      current = await adoptServedArea(user, served);
+    } else if (servedKey(page) !== served.key) {
+      throw new ScopeChangedError();
+    }
+
+    await applyResolutions(current, page.resolutions ?? [], summary, deviceId);
     pages += 1;
 
     if (!page.hasMore || !page.nextCursor) break;
@@ -670,24 +758,29 @@ async function pullResolutions(user, summary, { since, deviceId }) {
   }
 
   summary.resolutionPages = pages;
-  return until;
+  return { until, served, user: current };
 }
 
 /**
- * Walks the record pages of a window whose edge the resolutions feed has
- * already fixed.
+ * Walks the record pages of a window whose edge and scope the resolutions feed
+ * has already fixed.
  */
-async function pullRecords(user, summary, { since, until }) {
+async function pullRecords(user, summary, { since, scope, until, servedScope }) {
   let after = null;
   let pages = 0;
 
   for (;;) {
     const page = await pullPageWithRetry({
       since,
+      scope,
       until,
       after,
       limit: PULL_PAGE_SIZE,
     });
+
+    // Checked before the page is applied. Rows from another scope belong to a
+    // window this sync is not reading, and the cursor must not claim them.
+    if (servedKey(page) !== servedScope) throw new ScopeChangedError();
 
     await applyPulledPage(user, page.records ?? [], summary);
     pages += 1;
@@ -708,12 +801,12 @@ async function pullRecords(user, summary, { since, until }) {
  * releaseLegacyDeletionLock() in pullRules.js.
  *
  * Only the signed-in user's rows: the lock is released into the push queue, and
- * the push queue is per user. Another worker's flagged rows wait for them.
+ * the push queue is per editor. Another worker's flagged rows wait for them.
  */
 async function releaseLegacyDeletionLocks(user, summary) {
   await db.transaction("rw", db.records, async () => {
     const locked = await db.records
-      .where("[createdBy+syncState]")
+      .where("[lastEditedBy+syncState]")
       .equals([user.userId, SYNC_STATE.CONFLICT])
       .toArray();
 
@@ -745,31 +838,47 @@ async function releaseLegacyDeletionLocks(user, summary) {
  * pullRules.js make harmless.
  */
 async function pullChanges(user, summary) {
-  const since = await getSyncCursor(user.userId);
+  const cursor = await getSyncCursor(user.userId);
   // Which phone this is, so the resolutions half can recognise the disputes
   // this phone raised. One value per install; read once per sync.
   const deviceId = await getDeviceId();
 
-  const until = await pullResolutions(user, summary, { since, deviceId });
+  // The same request on every page of both halves: the cursor and the scope it
+  // was advanced in. The server honours the one only alongside the other.
+  const request = { since: cursor?.until ?? null, scope: cursor?.scope ?? null };
 
-  // A response with no serverTime cannot be windowed. Stop with the cursor
-  // unmoved rather than read records over an interval nobody fixed.
-  if (!until) return;
+  const {
+    until,
+    served,
+    user: current,
+  } = await pullResolutions(user, summary, { ...request, deviceId });
 
-  await pullRecords(user, summary, { since, until });
+  // A response with no serverTime or scope cannot be windowed, or its cursor
+  // stamped. Stop with the cursor unmoved rather than read records over an
+  // interval nobody fixed.
+  if (!until || !served) return;
+
+  await pullRecords(current, summary, { ...request, until, servedScope: served.key });
 
   // After BOTH halves, never before the resolutions: a flagged row that was a
   // real conflict already decided on the server must be adopted by its
   // resolution, not re-pushed into a second dispute. Released rows go up with
   // the next sync's push — one push phase per sync, before the pull, as always.
-  await releaseLegacyDeletionLocks(user, summary);
+  await releaseLegacyDeletionLocks(current, summary);
+
+  // Where this window really began: the old cursor if the server honoured it,
+  // the beginning if the scope had changed.
+  const since = windowStart(cursor, served.key);
 
   // Only forward. resolveWindow() already refuses to hand back an edge below
   // the cursor it was given, but a cursor that moves backwards re-delivers what
   // has been applied, so the device checks too rather than trusting a response
   // to be well-formed.
   if (!since || until > since) {
-    await db.meta.put({ key: cursorKey(user.userId), value: until });
+    await db.meta.put({
+      key: cursorKey(user.userId),
+      value: { until, scope: served.key },
+    });
   }
   await db.meta.put({ key: lastSyncKey(user.userId), value: until });
 }
@@ -808,6 +917,9 @@ function emptySummary() {
     needsOnlineSignIn: false,
     transportError: null,
     signedOut: false,
+    // This user's area or role changed on the server during the sync. The
+    // cursor was not moved; the next sync reads the new scope from the start.
+    scopeChanged: false,
   };
 }
 
@@ -854,6 +966,10 @@ async function executeSync() {
     // caller is told to ask for a sign-in.
     if (error instanceof NotAuthenticatedError) {
       summary.needsOnlineSignIn = true;
+    } else if (error instanceof ScopeChangedError) {
+      // Not a failure of anything on this device, and nothing is lost: what was
+      // applied is real, and the unmoved cursor makes the next sync re-read it.
+      summary.scopeChanged = true;
     } else if (error instanceof NetworkError) {
       // Out of retries, or offline the whole time. Every row is still pending,
       // which is exactly where it should be.

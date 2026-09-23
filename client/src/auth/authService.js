@@ -35,6 +35,10 @@ function toUser(row) {
     fullName: row.fullName,
     role: row.role,
     organizationId: row.organizationId,
+    // Undefined on rows cached before areas existed; null means "no area".
+    // Both read the same everywhere they are used.
+    areaId: row.areaId ?? null,
+    areaName: row.areaName ?? null,
   };
 }
 
@@ -93,6 +97,12 @@ async function loginOnline({ phone, password }) {
     fullName: profile.fullName,
     role: profile.role,
     organizationId: profile.organizationId,
+    // What the list shows a field worker: records of this area. Only a display
+    // decision — the server reads the area from its own database on every sync
+    // — and kept current by each sync (see updateCachedArea) so a worker moved
+    // to another village does not have to sign out to see it.
+    areaId: profile.areaId ?? null,
+    areaName: profile.areaName ?? null,
     offlineHash,
     accessToken,
     refreshToken,
@@ -255,6 +265,23 @@ export async function removeAccountFromDevice() {
   );
 
   if (row?.refreshToken) void revokeRefreshTokenQuietly(row.refreshToken);
+}
+
+/**
+ * Records the area the server says this user is in now.
+ *
+ * Called by the sync engine with the scope each pull reports. Guarded on the
+ * user id, inside a transaction: authCache holds only the person signed in on
+ * this device, and a sync that finishes after someone else has signed in must
+ * not write the previous user's area onto the new user's row.
+ */
+export async function updateCachedArea(userId, { areaId, areaName }) {
+  await db.transaction("rw", db.authCache, async () => {
+    const row = await db.authCache.get(userId);
+    if (!row) return;
+    if (row.areaId === areaId && row.areaName === areaName) return;
+    await db.authCache.update(userId, { areaId, areaName });
+  });
 }
 
 /**

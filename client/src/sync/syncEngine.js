@@ -54,20 +54,37 @@ const PULL_PAGE_SIZE = 100;
  * permanently. Kept opaque, it is simply a token the server issued and the
  * device hands back.
  *
- * Written ONLY after the final page of a pull has been applied.
+ * ONE PER USER, NOT ONE PER PHONE.
+ *
+ * A cursor says "everything in MY scope up to here has been applied". Scope is
+ * per user — a field worker pulls their own records, a supervisor the
+ * organisation, and the resolutions feed is conflicts you raised or records you
+ * captured. A single device-wide cursor let one person's sync on a shared phone
+ * move it past records and resolutions that were in someone else's scope and
+ * never fetched for them. Nothing re-offers what falls below a cursor, so those
+ * never arrived — and a row locked waiting for its resolution stayed locked for
+ * good. Keyed by user, each person's window is theirs alone.
+ *
+ * One cursor covers BOTH halves of a sync, records and resolutions, and that is
+ * deliberate rather than an omission. Both are read over one closed window and
+ * the cursor moves once, after both have been applied. Two cursors could advance
+ * separately — records past a window whose resolutions failed — which is the
+ * exact "moved past something never delivered" failure this key exists to end.
+ *
+ * Written ONLY after the final page of both halves has been applied. Signing out
+ * keeps it, so a worker returning to a shared phone resumes where they left off;
+ * removeAccountFromDevice() clears the whole meta table, cursors included.
  */
-const SYNC_CURSOR_META_KEY = "syncCursor";
+const SYNC_CURSOR_PREFIX = "syncCursor:";
 
-// When the server last answered, as the SERVER dated it — not Date.now().
-// Shown to the worker, and shown in the server's own words for the same reason
-// the cursor is: a phone with a wrong clock would otherwise report a confident,
-// wrong time for something that happened on another machine entirely.
-const LAST_SYNC_META_KEY = "serverSyncedAt";
+// When the server last answered this USER on this device, as the SERVER dated
+// it — not Date.now(). Per user for the same reason as the cursor: on a shared
+// phone, "Last synced 10:32" under the second worker's name would be the first
+// worker's sync, telling them their records went up when they did not.
+const LAST_SYNC_PREFIX = "serverSyncedAt:";
 
-// The device-clock value this key used to hold, before the server's timestamp
-// replaced it. Deleted on the next successful sync so no device is left carrying
-// a number under a name that now means a string.
-const LEGACY_DEVICE_CLOCK_KEY = "lastSyncAt";
+const cursorKey = (userId) => `${SYNC_CURSOR_PREFIX}${userId}`;
+const lastSyncKey = (userId) => `${LAST_SYNC_PREFIX}${userId}`;
 
 // Fired after every sync attempt so any screen showing record state can re-read.
 // A window event rather than a callback list: sync can start from a button in
@@ -82,16 +99,22 @@ export const PUSH_STATUS = {
 };
 
 /**
- * When the server last answered this device, in the server's own words.
- * A string such as "2026-09-22 15:16:21.934000", for display only.
+ * When the server last answered the signed-in user on this device, in the
+ * server's own words. A string such as "2026-09-22 15:16:21.934000", for
+ * display only.
  */
 export async function getLastSyncAt() {
-  const row = await db.meta.get(LAST_SYNC_META_KEY);
+  const user = await getCachedUser();
+  if (!user) return null;
+  const row = await db.meta.get(lastSyncKey(user.userId));
   return typeof row?.value === "string" ? row.value : null;
 }
 
-async function getSyncCursor() {
-  const row = await db.meta.get(SYNC_CURSOR_META_KEY);
+// Null for a user who has never synced on this phone, which pulls from the
+// beginning — exactly like a fresh install. See REPLAY SAFETY in pullRules.js
+// for why a full replay is harmless on both halves.
+async function getSyncCursor(userId) {
+  const row = await db.meta.get(cursorKey(userId));
   return typeof row?.value === "string" ? row.value : null;
 }
 
@@ -499,12 +522,13 @@ function toResolutionNotice(user, resolution, discarded) {
   // What the record said on the SERVER immediately before the decision replaced
   // it — as opposed to `discarded`, which is what THIS PHONE was holding.
   //
-  // The two differ, and the difference is the whole reason this is carried. On
-  // the phone of the worker who captured the record, the record pull earlier in
-  // this same sync has already overwritten the local copy with the new version,
-  // so by the time this runs there is nothing left on the device to snapshot.
-  // Their answers — the ones a supervisor just overrode — come back only
-  // because the server kept them (record_conflicts.superseded_payload).
+  // The server's copy is used rather than whatever this row holds, even though
+  // resolutions now run before the record pages and the row is still untouched
+  // at this point. The row may be several versions behind — a phone offline for
+  // a week — and what it holds is then OLDER than what the decision replaced.
+  // Showing that as "what the record said before" would put the wrong answers in
+  // front of the worker. record_conflicts.superseded_payload is the exact
+  // version the supervisor overrode.
   //
   // Kept only when it tells the worker something: not when it matches what the
   // record says now, and not when it would repeat the discarded copy shown
@@ -539,12 +563,19 @@ function toResolutionNotice(user, resolution, discarded) {
 /**
  * Applies one page of resolutions, in one Dexie transaction.
  *
- * Runs AFTER the record pages of the same window, and that order is deliberate:
- * a resolved record arriving in those pages hits REFRESH_CONFLICT, which only
- * updates the server copy shown beside the worker's. This has the last word and
- * is the one thing allowed to take a row out of conflict.
+ * Runs BEFORE the record pages of the same window, and the order matters. The
+ * decision whether to tell a worker about a resolution turns on whether their
+ * row still holds the version it replaced (see heldReplacedVersion() in
+ * pullRules.js). Run after the records, the ordinary pull would already have
+ * overwritten that row with the new version, and the evidence would be gone —
+ * so every notice would either be lost or have to be guessed at.
+ *
+ * Nothing the record pages do afterwards undoes this: an adopted row is synced
+ * at the server's version, so its record arrives as SKIP; a notified row keeps
+ * its notice through an overwrite (toLocalRow carries it across); and a row
+ * still locked for a different dispute only has its server copy refreshed.
  */
-async function applyResolutions(user, resolutions, summary) {
+async function applyResolutions(user, resolutions, summary, deviceId) {
   if (resolutions.length === 0) return;
 
   await db.transaction("rw", db.records, async () => {
@@ -556,7 +587,7 @@ async function applyResolutions(user, resolutions, summary) {
       // hands during it.
       if (local && local.createdBy !== user.userId) continue;
 
-      const { action } = classifyResolution(local ?? null);
+      const { action } = classifyResolution(local ?? null, resolution, deviceId);
 
       if (action === RESOLUTION_ACTION.SKIP) continue;
 
@@ -587,10 +618,15 @@ async function applyResolutions(user, resolutions, summary) {
 }
 
 /**
- * Walks the resolutions feed to the end of the SAME window the records pull
- * used, so one sync reads one closed interval across both halves.
+ * Walks the resolutions feed over one closed window, and returns that window's
+ * upper edge for the record pull to reuse.
+ *
+ * It goes first, so it is the half that fixes the edge: its first page's
+ * serverTime becomes `until` for every page of both feeds, and one sync reads
+ * one interval across the pair.
  */
-async function pullResolutions(user, summary, { since, until }) {
+async function pullResolutions(user, summary, { since, deviceId }) {
+  let until = null;
   let after = null;
   let pages = 0;
 
@@ -602,7 +638,8 @@ async function pullResolutions(user, summary, { since, until }) {
       limit: PULL_PAGE_SIZE,
     });
 
-    await applyResolutions(user, page.resolutions ?? [], summary);
+    until ??= page.serverTime;
+    await applyResolutions(user, page.resolutions ?? [], summary, deviceId);
     pages += 1;
 
     if (!page.hasMore || !page.nextCursor) break;
@@ -610,24 +647,14 @@ async function pullResolutions(user, summary, { since, until }) {
   }
 
   summary.resolutionPages = pages;
+  return until;
 }
 
 /**
- * Walks the delta window to its end, then moves the cursor.
- *
- * The cursor is written ONCE, after the final page. Advancing it per page would
- * mean an interrupted pull — a tunnel, a flat battery, a closed tab — leaves the
- * cursor past records that were never fetched, and the next window starts above
- * them. They are not retried, because nothing knows they were missed.
+ * Walks the record pages of a window whose edge the resolutions feed has
+ * already fixed.
  */
-async function pullChanges(user, summary) {
-  const since = await getSyncCursor();
-
-  // Fixed by the first page and sent back on every page after it, so all pages
-  // of one sync read ONE closed interval. If each page took a fresh upper edge,
-  // the interval the stored cursor claims to cover would not be the interval the
-  // earlier pages were actually drawn from.
-  let until = null;
+async function pullRecords(user, summary, { since, until }) {
   let after = null;
   let pages = 0;
 
@@ -639,7 +666,6 @@ async function pullChanges(user, summary) {
       limit: PULL_PAGE_SIZE,
     });
 
-    until ??= page.serverTime;
     await applyPulledPage(user, page.records ?? [], summary);
     pages += 1;
 
@@ -651,33 +677,42 @@ async function pullChanges(user, summary) {
   }
 
   summary.pullPages = pages;
+}
 
-  // The second half of the same window: which disagreements were settled in it.
-  //
-  // Inside pullChanges, and BEFORE the cursor moves, on purpose. If this threw
-  // after the cursor had advanced, every resolution in the window would fall
-  // below the next window's floor and never be offered again — and the rows they
-  // were about would stay frozen in conflict forever, with nothing anywhere
-  // recording that the exit had been missed. Leaving the cursor unmoved costs
-  // one re-read of a window the device has already applied, which is free:
-  // records re-arrive as SKIP, and a resolution re-applied to a row that has
-  // already left conflict is a NOTIFY that rewrites the same notice.
-  if (until) {
-    await pullResolutions(user, summary, { since, until });
-  }
+/**
+ * Both halves of the delta window — resolutions, then records — and only then
+ * the signed-in user's cursor.
+ *
+ * The cursor is written ONCE, after the final page of both. Advancing it any
+ * earlier means an interrupted sync — a tunnel, a flat battery, a closed tab —
+ * leaves it past something that was never fetched, and the next window starts
+ * above it. Nothing retries it, because nothing knows it was missed; for a
+ * resolution, that is a row locked for good. Leaving the cursor unmoved costs
+ * one re-read of a window already applied, which the replay rules in
+ * pullRules.js make harmless.
+ */
+async function pullChanges(user, summary) {
+  const since = await getSyncCursor(user.userId);
+  // Which phone this is, so the resolutions half can recognise the disputes
+  // this phone raised. One value per install; read once per sync.
+  const deviceId = await getDeviceId();
 
-  // Only now, and only forward. resolveWindow() already refuses to hand back an
-  // edge below the cursor it was given, but a cursor that moves backwards
-  // re-delivers rows the device has already applied, so the device checks too
-  // rather than trusting a response to be well-formed.
-  if (until && (!since || until > since)) {
-    await db.meta.put({ key: SYNC_CURSOR_META_KEY, value: until });
-  }
+  const until = await pullResolutions(user, summary, { since, deviceId });
 
-  if (until) {
-    await db.meta.put({ key: LAST_SYNC_META_KEY, value: until });
-    await db.meta.delete(LEGACY_DEVICE_CLOCK_KEY);
+  // A response with no serverTime cannot be windowed. Stop with the cursor
+  // unmoved rather than read records over an interval nobody fixed.
+  if (!until) return;
+
+  await pullRecords(user, summary, { since, until });
+
+  // Only forward. resolveWindow() already refuses to hand back an edge below
+  // the cursor it was given, but a cursor that moves backwards re-delivers what
+  // has been applied, so the device checks too rather than trusting a response
+  // to be well-formed.
+  if (!since || until > since) {
+    await db.meta.put({ key: cursorKey(user.userId), value: until });
   }
+  await db.meta.put({ key: lastSyncKey(user.userId), value: until });
 }
 
 function emptySummary() {

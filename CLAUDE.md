@@ -22,6 +22,7 @@ No code in `client/src` may assume the internet exists. If a feature breaks when
 - All client fetches go through `apiFetch` in `client/src/lib/api.js`, always with relative `/api/...` paths. An absolute URL bypasses the Vite dev proxy and production Nginx.
 - Conventional commits: `feat:`, `fix:`, `chore:`, `docs:`.
 - Comment the **why**, not the what.
+- The developer runs **Windows PowerShell**, so commands must never use `<` input redirection; use `Get-Content file | mysql ...` instead.
 
 ## Offline-first invariants — do not break these
 
@@ -29,6 +30,7 @@ No code in `client/src` may assume the internet exists. If a feature breaks when
 - **Syncable tables carry `version`, `updated_at`, `deleted_at`.** Deletes are soft — a hard DELETE is invisible to an offline device, so rows become tombstones instead.
 - **`DATETIME(3)`, never plain `DATETIME`.** Second precision makes the sync window miss or duplicate rows edited in the same second.
 - **Sync cursors use the server's timestamp, never the device clock.** A fast phone clock silently skips records forever.
+- **Sync cursors are per user, never per device.** On a shared phone, one person's sync would otherwise move the cursor past what another person never pulled.
 - **Sync order is push, then pull.** Pulling first returns stale versions of rows the device is about to overwrite.
 - **`authCache` holds exactly one row** — the person signed in on this device. Never cache another user's hash or tokens.
 - The client decides what to *render*; the server decides what is *allowed*. Always re-check roles from the verified JWT, never from anything the client sends.
@@ -45,13 +47,13 @@ Sync
 - `PULL_COMMIT_LAG_MS` (1s) is a judgement, not a proof: a push or resolve transaction held open longer can commit below a cursor already handed out, and that row is never delivered.
 - Tombstones are never pruned, on the server or on any device that pulled them.
 - Supervisors and admins pull the whole organisation onto one device, so one lost supervisor phone exposes every household.
-- The sync cursor is one per device, not per user: another user syncing on a shared phone moves it past records and resolutions the first user never pulled, so those never arrive — and a conflicted row waiting on one stays frozen.
+- On a shared phone, a supervisor's organisation-wide pull moves a worker's rows forward, so that worker is not told about a resolution the supervisor's pull already applied.
 - `records` keeps no history: an ordinary accepted push overwrites the previous payload with no copy kept; only resolutions preserve what they replace (`superseded_*`).
 
 Conflicts
 - A conflicted row cannot be edited or deleted on the device — allowing it re-queues the row against its stale base and restarts the conflict loop.
   Mitigation: resolving the conflict makes the row editable again so the worker can delete it; a resolution itself deletes only when the losing push was a deletion (`submitted_deleted`).
-- `fileConflict`'s duplicate check ignores `submitted_deleted`, so an old build re-pushing the same payload as a deletion is folded into the earlier non-deletion conflict.
+- A row locked by the pull (the server deleted it while the phone held a rejected or unsent edit) has no conflict on the server, so no resolution can ever unlock it.
 - A worker who dismisses a resolution notice loses the only view they have of the earlier version; it survives in `record_conflicts`, readable by supervisors, not by them.
 
 ## Working style

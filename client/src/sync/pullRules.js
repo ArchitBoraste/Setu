@@ -110,8 +110,9 @@ export function classifyPulledRow(local, remote) {
     // a kept_server resolution writes nothing to the record at all, so "the
     // version moved" and "a person decided" are different facts and only one of
     // them travels on this feed. Leaving conflict state is driven by
-    // classifyResolution() below, off the conflict's own lifecycle, and the
-    // resolution is applied after this page so it has the last word.
+    // classifyResolution() below, off the conflict's own lifecycle. Resolutions
+    // for a window are applied BEFORE its record pages, so a row this reaches
+    // is one that is still genuinely locked.
     return { action: PULL_ACTION.REFRESH_CONFLICT };
   }
 
@@ -146,61 +147,140 @@ export function classifyPulledRow(local, remote) {
 // ---------------------------------------------------------------------------
 
 export const RESOLUTION_ACTION = {
-  // The row is in conflict and the dispute is over: take the server's copy
-  // whole, advance syncedVersion to the server's version, and rejoin normal
-  // operation.
+  // This phone's own dispute is over: take the server's copy whole, advance
+  // syncedVersion to the server's version, and rejoin normal operation.
   ADOPT: "adopt",
   // Tell the worker what was decided, and change not one byte of the record.
   NOTIFY: "notify",
-  // Nothing on this device to update.
+  // Nothing on this device to update, or nothing it has not already been told.
   SKIP: "skip",
 };
 
+// ---------------------------------------------------------------------------
+// REPLAY SAFETY
+//
+// Every rule below has to give the right answer for a resolution this device
+// has ALREADY applied, arriving again. That is not hypothetical. The sync
+// cursor is per user, so a user's first sync on a phone — including every user
+// on every phone once, when the per-user cursor replaced the per-device one —
+// starts from the beginning and receives every resolution ever made about their
+// records. Records survive that replay because classifyPulledRow() skips
+// anything at or below syncedVersion. Resolutions have to be made to survive it
+// here, and the two things that can go wrong are:
+//
+//   a stale ADOPT    an old resolution arriving while the row is locked for a
+//                    NEWER conflict would unlock it — replacing the worker's
+//                    copy and releasing the row while the dispute that actually
+//                    locked it is still open in the supervisor's queue.
+//
+//   a stale NOTIFY   a notice the worker read and dismissed months ago would
+//                    come back, and a row the decision deleted would reappear
+//                    in their list with it.
+//
+// Both are answered from state the device already holds — syncedVersion — so
+// replay safety needs no record of which resolutions have been seen, and holds
+// for devices that were already in the field before this rule existed.
+// ---------------------------------------------------------------------------
+
 /**
- * Takes the LOCAL row and nothing else, deliberately.
+ * Is this the resolution of the dispute THIS PHONE raised on this row?
  *
- * Which way the supervisor decided does not appear here, and must not: whether
- * this device may overwrite what it is holding is a question about this device's
- * unsent work, not about the verdict. A rule that read the resolution could be
- * talked into adopting over a pending row by the right value arriving in a
- * response, and the row it would overwrite is a household visit that exists on
- * one phone.
+ * A conflicted row is locked by exactly one push: the one this device sent from
+ * base = syncedVersion, which is frozen for as long as the row stays locked.
+ * record_conflicts keeps that push's device_id and base_version, so the pair
+ * names the dispute precisely:
  *
- * @param {object|null} local  the Dexie row, or null
+ *   another device's conflict about the same record   different device id
+ *   an older conflict from this device, already        smaller base: adopting
+ *   adopted — the replay case                           it moved syncedVersion
+ *                                                       past its base, and a
+ *                                                       later conflict can only
+ *                                                       be raised from there
+ *
+ * Retries of one push are folded into one conflict row by the server, so a
+ * device never has two open disputes with the same base.
+ *
+ * The limit, stated so it is not mistaken for complete: builds before the
+ * step-12 toWire fix pushed a row pulled from another phone under THAT phone's
+ * id. A conflict raised that way never matches here and the row stays locked.
+ * It needs an old build, a pulled row, and a conflict raised on it.
  */
-export function classifyResolution(local) {
-  // A resolution for a record this device does not hold. It may have been
-  // wiped, or belong to another worker on a shared phone. The record itself
-  // arrives through the ordinary pull if it is in scope; there is nothing here
-  // to reconcile.
+function isThisPhonesDispute(local, resolution, deviceId) {
+  const submitted = resolution.submitted ?? {};
+  return (
+    typeof deviceId === "string" &&
+    submitted.deviceId === deviceId &&
+    submitted.baseVersion === (local.syncedVersion ?? 0)
+  );
+}
+
+/**
+ * Did this row hold the version the decision replaced — so the worker's copy on
+ * this phone is what changed?
+ *
+ * superseded.version is the version the record carried immediately before the
+ * resolution overwrote it. A row at or below it held that content, or older;
+ * the decision is news here. A row above it has already been moved past the
+ * decision — by the pull that carried it, on this phone, some earlier sync —
+ * and telling the worker again is the stale-notice replay described above.
+ *
+ * kept_server replaced nothing, and resolutions made before migration 002 kept
+ * no superseded copy; neither has a replaced version to compare with, so
+ * neither announces itself to a phone that was not party to the dispute.
+ */
+function heldReplacedVersion(local, resolution) {
+  const superseded = resolution.superseded;
+  if (!superseded) return false;
+  return local.syncedVersion != null && local.syncedVersion <= superseded.version;
+}
+
+/**
+ * What a resolution arriving on this phone does to the local row.
+ *
+ * The unsent-work guarantee comes first and does not depend on the verdict: a
+ * row holding work the server has not accepted is never adopted over. Fields of
+ * the resolution are read only to NARROW what happens to a conflicted row —
+ * never to widen it — so no value in a response can talk this into overwriting
+ * a household visit that exists on one phone.
+ *
+ * @param {object|null} local       the Dexie row, or null
+ * @param {object}      resolution  one entry from GET /api/sync/resolutions
+ * @param {string}      deviceId    this install's id, from getDeviceId()
+ */
+export function classifyResolution(local, resolution, deviceId) {
+  // A resolution for a record this device does not hold. The record itself
+  // arrives through the ordinary pull if it is in scope. A fresh phone therefore
+  // gets no notices for decisions made long before it existed — it never held
+  // the versions they replaced.
   if (!local) return { action: RESOLUTION_ACTION.SKIP };
 
-  if (local.syncState === SYNC_STATE.CONFLICT) {
-    // The row this whole mechanism exists for.
+  if (
+    local.syncState === SYNC_STATE.CONFLICT &&
+    isThisPhonesDispute(local, resolution, deviceId)
+  ) {
+    // The row this whole mechanism exists for, and the only case that may move
+    // syncedVersion on a locked row.
     return { action: RESOLUTION_ACTION.ADOPT };
   }
 
-  // NOT in conflict — and the record is emphatically not touched here.
+  // Everything else leaves the record exactly as it is.
   //
-  // Two ways to arrive:
+  //   PENDING or REJECTED  work the server has not accepted. Adopting would
+  //                        overwrite a household visit that exists on one phone
+  //                        to settle a dispute this row is not part of. The
+  //                        next push carries its stale base, and the SERVER
+  //                        decides, as the only party holding both copies.
   //
-  //   PENDING or REJECTED  this device holds work the server has not accepted.
-  //                        Adopting would overwrite a household visit that
-  //                        exists on exactly one phone, in exactly one row, to
-  //                        settle a dispute this row is not part of. The
-  //                        ordinary push/pull machinery already handles it: the
-  //                        next push carries its stale base and the SERVER
-  //                        decides, which is right, because the server is the
-  //                        only party holding both copies.
+  //   CONFLICT, not ours   locked for a different dispute — another device's,
+  //                        or an older one of ours already adopted. It stays
+  //                        locked until ITS resolution arrives.
   //
-  //   SYNCED               this device agrees with the server, so there is
-  //                        nothing to adopt — the new version arrives through
-  //                        the normal record pull in this same window. But the
-  //                        worker is told anyway, and that is the point of this
-  //                        branch: when a supervisor keeps another device's copy
-  //                        or merges one, the record changes under the worker
-  //                        who captured it. A record silently becoming something
-  //                        else, on the phone of the person who walked to that
-  //                        household, is not acceptable.
-  return { action: RESOLUTION_ACTION.NOTIFY };
+  //   SYNCED               the new version arrives through the ordinary record
+  //                        pull. But the worker is told when their copy was the
+  //                        one replaced: a record silently becoming something
+  //                        else on the phone of the person who walked to that
+  //                        household is not acceptable.
+  return heldReplacedVersion(local, resolution)
+    ? { action: RESOLUTION_ACTION.NOTIFY }
+    : { action: RESOLUTION_ACTION.SKIP };
 }

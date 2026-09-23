@@ -110,10 +110,24 @@ function mayWrite(actor, stored) {
  */
 async function fileConflict(conn, actor, stored, incoming) {
   const [existing] = await conn.query(
+    // submitted_deleted is part of what makes two pushes "the same push". A
+    // deletion carrying the same answers as an earlier edit is a different act —
+    // the difference between a household staying in the register and leaving it
+    // — and folding it into the edit's open conflict would file the deletion as
+    // an edit. The supervisor would be shown no deletion to decide on, and
+    // keeping "the worker's version" would keep the household.
+    //
+    // A current build cannot reach this: a conflicted row is read-only, so it
+    // never sends a second push to fold. An older build that still lets a worker
+    // delete a conflicted row can. Against a conflict filed before migration 002
+    // (submitted_deleted = 0, meaning "unknown"), a deletion now files its own
+    // row rather than joining that one — a second queue entry, which is the
+    // recoverable direction to be wrong in.
     `SELECT id, payload
        FROM record_conflicts
       WHERE record_id = ? AND submitted_by = ? AND device_id = ?
-        AND base_version = ? AND server_version = ? AND status = 'open'
+        AND base_version = ? AND server_version = ? AND submitted_deleted = ?
+        AND status = 'open'
       ORDER BY created_at DESC
       LIMIT 5`,
     [
@@ -122,6 +136,7 @@ async function fileConflict(conn, actor, stored, incoming) {
       incoming.deviceId,
       incoming.baseVersion ?? 0,
       stored.version,
+      incoming.deleted ? 1 : 0,
     ]
   );
 
@@ -618,6 +633,7 @@ const RESOLUTION_COLUMNS = `
   rc.payload         AS submittedPayload,
   rc.submitted_deleted AS submittedDeleted,
   rc.submitted_by    AS submittedById,
+  rc.device_id       AS submittedDeviceId,
   ru.full_name       AS resolvedByName,
   DATE_FORMAT(rc.resolved_at, '${SERVER_TIME_FORMAT}') AS resolvedAt,
   rc.superseded_version      AS supersededVersion,
@@ -675,6 +691,12 @@ function toResolutionView(row) {
       baseVersion: row.baseVersion,
       collidedWithVersion: row.collidedWithVersion,
       byId: row.submittedById,
+      // Which phone raised this dispute. Together with baseVersion it is how a
+      // device recognises the resolution of ITS OWN conflict, as opposed to one
+      // about the same record raised somewhere else — see classifyResolution()
+      // in client/src/sync/pullRules.js. Not new information to the recipient:
+      // device ids already travel on every pulled record.
+      deviceId: row.submittedDeviceId,
     },
 
     // What the record said immediately before this resolution replaced it.

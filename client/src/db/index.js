@@ -87,6 +87,35 @@ db.version(4).upgrade((tx) =>
     })
 );
 
+// Version 5 retires the device-wide sync cursor. Cursors are now kept per user
+// (`syncCursor:<userId>`, see syncEngine.js), and the single one every phone in
+// the field is holding is DISCARDED, not handed to anybody.
+//
+// Handing it to someone was the alternative, and there is no one it can safely
+// belong to. It was last moved by whoever synced last, and that is not
+// recorded: authCache names the last person to sign in ONLINE, who may not yet
+// have synced at all. Give it to the wrong user and their window starts past
+// records and resolutions they never received — the exact loss per-user cursors
+// exist to end, locked in for one more user and invisible from then on.
+//
+// Discarding costs each user one pull from the beginning on each phone. The
+// correctness of that rests on two replay rules, one per half of the sync:
+//
+//   records      classifyPulledRow() skips anything at or below syncedVersion,
+//                keeps unsent work, and refreshes locked rows. A full replay
+//                applies exactly what a correct delta history would have.
+//
+//   resolutions  classifyResolution() adopts only this phone's OWN dispute and
+//                notifies only a row that still holds the replaced version, so
+//                a resolution applied long ago neither unlocks a row locked for
+//                a newer conflict nor brings back a dismissed notice.
+//
+// The last-synced label and the legacy device-clock key go with it: both were
+// device-wide, and both would otherwise sit in meta under names nothing reads.
+db.version(5).upgrade((tx) =>
+  tx.table("meta").bulkDelete(["syncCursor", "serverSyncedAt", "lastSyncAt"])
+);
+
 // Fired when another tab running newer code wants to upgrade the schema. Until
 // this tab closes the database, that upgrade is blocked and the new tab hangs on
 // an unopened database. Closing here unblocks it; this tab's own queries then

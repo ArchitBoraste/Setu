@@ -141,9 +141,10 @@ CREATE TABLE record_conflicts (
   form_type       VARCHAR(64)  NOT NULL,
   form_version    INT          NOT NULL DEFAULT 1,
   payload         JSON         NOT NULL,          -- the rejected copy, verbatim
-  -- Whether the rejected push was a deletion. 0 on rows filed before 002 means
-  -- unknown, which is why a resolution only ever acts on 1.
-  submitted_deleted TINYINT(1) NOT NULL DEFAULT 0,
+  -- Whether the rejected push was a deletion: 1 yes, 0 no, NULL not recorded
+  -- (filed before migration 002, or 0 before 003 — see that migration for why
+  -- those were demoted). A resolution acts on 1 and 0, and never on NULL.
+  submitted_deleted TINYINT(1) NULL DEFAULT NULL,
   status          ENUM('open','resolved') NOT NULL DEFAULT 'open',
   resolution      ENUM('kept_server','kept_client','merged') NULL,
   resolved_by     CHAR(36)     NULL,

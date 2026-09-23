@@ -518,7 +518,7 @@ async function applyPulledPage(user, records, summary) {
  * there is nothing discarded, and telling them their data was dropped when it
  * was adopted would be its own kind of wrong.
  */
-function toResolutionNotice(user, resolution, discarded) {
+function toResolutionNotice(user, resolution, discarded, local) {
   // What the record said on the SERVER immediately before the decision replaced
   // it — as opposed to `discarded`, which is what THIS PHONE was holding.
   //
@@ -555,6 +555,18 @@ function toResolutionNotice(user, resolution, discarded) {
     // your version" is only a complete sentence when that version and the
     // record's current state agree about whether the household still exists.
     submittedDeleted: resolution.submitted?.deleted === true,
+    // The decision put a deleted household back in the register.
+    //
+    // Worked out here rather than sent by the server, because record_conflicts
+    // keeps what a resolution replaced but not whether the record was deleted
+    // before it. This phone knows: resolutions run before the record pages, so
+    // the row still shows the server's state as this phone last saw it — as the
+    // tombstone beside a conflicted or unsent row, or as the synced row itself.
+    // Only keep-worker can restore, so only keep-worker is credited with it.
+    restored:
+      resolution.resolution === "kept_client" &&
+      resolution.record?.deletedAt == null &&
+      heldAsDeleted(local),
     discardedPayload: discarded ? discarded.payload : null,
     discardedVersion: discarded ? discarded.version : null,
     supersededPayload: showSuperseded ? superseded.payload : null,
@@ -562,6 +574,13 @@ function toResolutionNotice(user, resolution, discarded) {
     // Device clock, and only ever used to order notices on screen.
     noticedAt: Date.now(),
   };
+}
+
+// Whether this phone's row showed the record as deleted on the server.
+function heldAsDeleted(local) {
+  if (!local) return false;
+  if (local.serverConflict?.deletedAt != null) return true;
+  return local.syncState === SYNC_STATE.SYNCED && local.deletedAt != null;
 }
 
 /**
@@ -599,7 +618,7 @@ async function applyResolutions(user, resolutions, summary, deviceId) {
         // The record is NOT touched. Only the notice is written, so a row
         // holding unsent work keeps it and a synced row is not churned.
         await db.records.update(local.id, {
-          resolvedNotice: toResolutionNotice(user, resolution, null),
+          resolvedNotice: toResolutionNotice(user, resolution, null, local),
         });
         summary.resolutionsNoticed += 1;
         continue;
@@ -614,7 +633,7 @@ async function applyResolutions(user, resolutions, summary, deviceId) {
 
       await db.records.put({
         ...toLocalRow(resolution.record, user.organizationId, local),
-        resolvedNotice: toResolutionNotice(user, resolution, replaced ? local : null),
+        resolvedNotice: toResolutionNotice(user, resolution, replaced ? local : null, local),
       });
       summary.resolutionsApplied += 1;
     }

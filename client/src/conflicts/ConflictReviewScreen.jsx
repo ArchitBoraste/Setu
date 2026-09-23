@@ -135,17 +135,23 @@ function VersionCompare({ conflict }) {
         );
       })}
 
-      {(current.deletedAt || submitted.deleted) && (
+      {(current.deletedAt || submitted.deleted === true) && (
         <Fragment>
           {/* Either side being a deletion is a different decision from a
               disagreement about answers, and it is the one a supervisor can
-              least afford to miss in a column of field values. */}
+              least afford to miss in a column of field values. The worker's
+              side has three answers, not two: "not recorded" is shown as such,
+              because it is what stops keep-worker from restoring. */}
           <span style={styles.muted}>Deleted</span>
           <span style={styles.differs}>
             {current.deletedAt ? `yes, ${shortTime(current.deletedAt)}` : "no"}
           </span>
           <span style={styles.differs}>
-            {submitted.deleted ? "yes — this copy deletes the record" : "no"}
+            {submitted.deleted === true
+              ? "yes — this copy deletes the record"
+              : submitted.deleted === false
+                ? "no — a live edit"
+                : "not recorded"}
           </span>
         </Fragment>
       )}
@@ -174,10 +180,13 @@ function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onB
   const only = (payload) =>
     Object.fromEntries(replaced.map((field) => [field, payload?.[field] ?? null]));
 
-  // Mirrors conflictRules.js exactly. kept_client deletes only on a recorded
-  // deletion; nothing un-deletes; merges never change existence.
-  const deletes = resolution === "kept_client" && submitted.deleted && !current.deletedAt;
-  const staysDeleted = Boolean(current.deletedAt);
+  // Mirrors conflictRules.js exactly. kept_client takes the worker's existence
+  // when it was RECORDED — a deletion deletes, a live edit restores — and leaves
+  // it alone when it was not. Merges never change existence.
+  const keepingWorker = resolution === "kept_client";
+  const deletes = keepingWorker && submitted.deleted === true && !current.deletedAt;
+  const restores = keepingWorker && submitted.deleted === false && Boolean(current.deletedAt);
+  const staysDeleted = Boolean(current.deletedAt) && !restores;
 
   const count = replaced.length;
   const fieldsPhrase = `${count} ${count === 1 ? "field" : "fields"}`;
@@ -216,11 +225,29 @@ function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onB
         </p>
       )}
 
+      {restores && (
+        <p style={styles.danger}>
+          {/* Stated as plainly as a deletion, because it is the same size of
+              decision in the other direction: a household the server removed
+              goes back into the register. If it was removed because the family
+              withdrew consent, this is the moment to stop. */}
+          This also <strong>restores the record</strong>: it was deleted on the
+          server, and the worker&apos;s copy is a live edit — keeping it puts the
+          household back in the register.
+        </p>
+      )}
+
       {staysDeleted && (
         <p style={styles.muted}>
-          This record is already deleted on the server and stays deleted —
-          resolving a conflict never restores a record. Restore it separately if
-          that is what you mean.
+          {keepingWorker && submitted.deleted === null
+            ? "This record is deleted on the server and stays deleted: whether the worker's copy was a deletion was not recorded, so keeping it cannot restore the record."
+            : keepingWorker
+              ? "This record is deleted on the server and stays deleted: the worker's copy is a deletion too."
+              : `A merge never changes whether a record exists, so this record stays deleted.${
+                  submitted.deleted === false
+                    ? " To restore it, keep the worker's version instead."
+                    : ""
+                }`}
         </p>
       )}
 
@@ -233,7 +260,9 @@ function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onB
         <button onClick={onConfirm} disabled={busy}>
           {deletes
             ? "Keep the worker's version and delete the record"
-            : count === 0
+            : restores
+              ? "Keep the worker's version and restore the record"
+              : count === 0
               ? "Confirm"
               : `Replace ${fieldsPhrase}`}
         </button>{" "}
@@ -517,7 +546,9 @@ export default function ConflictReviewScreen() {
       setResult(
         answer.recordDeleted
           ? `Saved. The record is deleted (version ${answer.version}), and the version it replaced is kept with the conflict.`
-          : answer.recordChanged
+          : answer.recordRestored
+            ? `Saved. The record is restored (version ${answer.version}): the household is back in the register, and the version it replaced is kept with the conflict.`
+            : answer.recordChanged
             ? `Saved. The record is now version ${answer.version} and will reach every device on their next sync. The version it replaced is kept with the conflict.`
             : "Saved. The record was already right, so nothing was rewritten."
       );

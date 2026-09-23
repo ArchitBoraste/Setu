@@ -240,18 +240,28 @@ function ConflictCompare({ record }) {
 // losing copy — "a supervisor kept your version" would simply be untrue to them,
 // and a notice that tells somebody something they know to be wrong is a notice
 // they stop reading.
-function resolutionHeadline({ resolution, submittedByMe, submittedDeleted }, record) {
+function resolutionHeadline({ resolution, submittedByMe, submittedDeleted, restored }, record) {
   if (resolution === "merged") {
     return "A supervisor combined both versions of this record, field by field.";
   }
   if (resolution === "kept_client") {
+    // Restoring is the biggest thing that can happen to a household record short
+    // of deleting it, and the worker who walked there needs it named, not folded
+    // into "kept your version" — which would read the same whether the household
+    // came back or not.
+    if (restored) {
+      return submittedByMe
+        ? "A supervisor kept your version and restored this household, which had been deleted on the server."
+        : "A supervisor restored this household, which had been deleted, with another worker's version.";
+    }
     if (!submittedByMe) {
       return "A supervisor replaced this record with another worker's version.";
     }
-    // Keeping a worker's live copy never restores a deleted record (see the
-    // closing note in server/sync/conflictRules.js). "Kept your version" on its
-    // own would tell the worker their household is back in the register when it
-    // is not — so the answers and the deletion are named separately.
+    // Keep-worker leaves a deleted record deleted when nobody recorded whether
+    // the worker's copy was a deletion (see the closing note in
+    // server/sync/conflictRules.js). "Kept your version" on its own would tell
+    // the worker their household is back in the register when it is not — so
+    // the answers and the deletion are named separately.
     return record.deletedAt && !submittedDeleted
       ? "A supervisor kept your answers, but the record stays deleted."
       : "A supervisor kept your version of this record.";
@@ -307,6 +317,11 @@ function ResolutionNotice({ record, onDismiss, busy }) {
           </>
         ) : (
           <>
+            {notice.restored && (
+              <>
+                It is <strong>back in the register</strong>.{" "}
+              </>
+            )}
             This record now reads as version {record.version}. It is back in sync
             and you can edit it again.
           </>

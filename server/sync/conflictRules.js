@@ -40,6 +40,18 @@ export const RESOLUTION = {
   MERGED: "merged",
 };
 
+// What a resolution does to whether the record exists. Kept apart from the
+// answers because the two are decided on different evidence: the answers by a
+// supervisor's choice, existence by what the losing push is KNOWN to have been.
+export const EXISTENCE = {
+  // Leave deleted_at exactly as it is.
+  KEEP: "keep",
+  // Make the record a tombstone (keeping an existing tombstone's time).
+  DELETE: "delete",
+  // Clear deleted_at: the household is back in the register.
+  RESTORE: "restore",
+};
+
 export const RESOLVE_ERROR = {
   INVALID: "invalid_resolution",
   PAYLOAD: REJECT_REASON.PAYLOAD,
@@ -78,7 +90,8 @@ function snapshotOf(record) {
  *               route's, not new ones: version + 1, and an explicitly written
  *               updated_at, so a resolved record travels to other devices
  *               through the ordinary delta window like any other change.
- *               `write.deletes` is true when the record must become a tombstone.
+ *               `write.existence` is one of EXISTENCE: whether the record
+ *               becomes a tombstone, is restored, or keeps its deleted_at.
  *
  *   superseded  what the record held before `write` replaces it, to be kept in
  *               record_conflicts. Null exactly when `write` is null: nothing
@@ -87,6 +100,7 @@ function snapshotOf(record) {
  * @param {object} args
  * @param {string} args.resolution     kept_server | kept_client | merged
  * @param {object} args.conflict       { formType, formVersion, payload, submittedDeleted }
+ *                                     submittedDeleted is 1, 0 or null (not recorded)
  * @param {object} args.record         { formType, formVersion, payload, version }
  * @param {object} args.mergedPayload  the supervisor's assembled payload, for merged
  */
@@ -129,10 +143,11 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
     // household visit permanently unchoosable — the supervisor would be blocked
     // from picking the only other copy that exists.
     //
-    // And the losing copy's EXISTENCE comes with it, one way only. "Keep the
-    // worker's version" means the whole of what the worker sent — and if what
-    // they sent was a deletion, the household leaves the register. See the note
-    // at the foot of this file for why a 0 here never un-deletes anything.
+    // And the losing copy's EXISTENCE comes with it, when it is known. "Keep
+    // the worker's version" means the whole of what the worker sent: a deletion
+    // takes the household out of the register, a live edit puts it back in.
+    // When nobody recorded which it was, existence is left alone — see the note
+    // at the foot of this file.
     return {
       value: {
         resolution,
@@ -142,7 +157,7 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
           payload: conflict.payload,
           payloadText: JSON.stringify(conflict.payload),
           version: record.version + 1,
-          deletes: Boolean(conflict.submittedDeleted),
+          existence: existenceFromLosingPush(conflict.submittedDeleted),
         },
         superseded: snapshotOf(record),
       },
@@ -174,47 +189,70 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
         payload: payload.value.payload,
         payloadText: payload.value.payloadText,
         version: record.version + 1,
-        // A merge decides answers, field by field. Whether the household stays
-        // in the register is not a field, and a supervisor assembling a payload
-        // has not been asked about it — so a merge leaves existence alone.
-        deletes: false,
+        // A merge never changes whether the record exists. See the note at the
+        // foot of this file for why, now that keep-worker can restore.
+        existence: EXISTENCE.KEEP,
       },
       superseded: snapshotOf(record),
     },
   };
 }
 
+/**
+ * Keep-worker's effect on existence, from what record_conflicts RECORDED about
+ * the losing push.
+ *
+ * mysql2 hands a TINYINT(1) back as a number, so the checks are against 1 and 0
+ * exactly: anything else — NULL, above all — is "not recorded", and does nothing.
+ */
+function existenceFromLosingPush(submittedDeleted) {
+  if (submittedDeleted === 1) return EXISTENCE.DELETE;
+  if (submittedDeleted === 0) return EXISTENCE.RESTORE;
+  return EXISTENCE.KEEP;
+}
+
 // ---------------------------------------------------------------------------
 // WHEN A RESOLUTION DECIDES WHETHER THE RECORD EXISTS — AND WHEN IT DOES NOT.
 //
-// Until migration 002 a resolution never touched deleted_at, because the server
-// did not know whether the copy that lost was an edit or a deletion: filing a
-// conflict dropped the push's `deleted` flag. A resolution that moved the
-// tombstone would have been guessing at a worker's intent.
+// kept_client — keep the worker's version, the WHOLE of it, including whether
+// it was a deletion. record_conflicts.submitted_deleted (migration 003) says
+// what is known about that:
 //
-// record_conflicts.submitted_deleted now records it, so kept_client can honour
-// it — in ONE direction:
+//   1      the worker's push was a deletion. The record becomes a tombstone; if
+//          it already was one, it keeps the moment it was first raised, the push
+//          route's rule, so a device that applied the earlier deletion does not
+//          see it as a newer event.
 //
-//   submitted_deleted = 1   the worker's push was a deletion, and the
-//                           supervisor chose the worker's version. The record
-//                           becomes a tombstone. If it already was one, it keeps
-//                           the moment it was first raised, the same rule the
-//                           push route applies, so a device that applied the
-//                           earlier deletion does not see it as a newer event.
+//   0      the worker's push was a live edit. deleted_at is cleared: if the
+//          server had deleted the record, the household is back in the register
+//          with the worker's answers. This is the outcome that did not exist
+//          before 003 — a server deletion met by a worker's live edit could only
+//          ever end deleted, whichever button the supervisor pressed.
 //
-//   submitted_deleted = 0   deleted_at is left EXACTLY as it is. Never cleared.
+//   NULL   not recorded (filed before 002, or a 0 from before 003). deleted_at
+//          is left EXACTLY as it is. Treating an unknown as "live, so restore"
+//          would resurrect a household on the strength of a missing value — the
+//          one outcome here that can put a family that withdrew consent back in
+//          the register. An unknown must be able to do nothing.
 //
-// The asymmetry is deliberate. Every conflict filed before 002 carries 0, and on
-// those rows 0 means "never recorded", not "was an edit". Treating 0 as "the
-// worker's version is live, so undelete" would resurrect a household on the
-// strength of a column default — the one outcome here that can put a family
-// that withdrew consent back into the register. An unknown must be able to do
-// nothing, and only a recorded 1 is allowed to act.
+// kept_server — the server's copy stands whole, existence included. Nothing is
+// written.
 //
-// The cost: kept_client against a record the SERVER had deleted leaves it
-// deleted, even when the worker's copy was a live edit. The review screen says
-// so before the supervisor confirms, and restoring a record stays what it was
-// before — an ordinary, explicit write afterwards, attributable on its own.
+// merged — NEVER changes existence, even now that keep-worker can restore.
 //
-// Merges and kept_server never change existence, for the reasons beside them.
+//   A merge is the supervisor assembling ANSWERS, field by field, from two
+//   copies. Whether the household stays in the register is not an answer, and
+//   the merge editor never asks about it. Letting either side's existence ride
+//   along would decide it without the supervisor ever being shown it as a
+//   choice — silently restoring a household that withdrew consent because a
+//   field came from the worker's side, or silently keeping one deleted because
+//   another came from the server's.
+//
+//   So existence is decided only by the two resolutions that take one copy
+//   WHOLE, and whose preview states the consequence before it happens:
+//   kept_server keeps the server's, kept_client takes the worker's. A supervisor
+//   who wants the household restored AND answers from both sides cannot do that
+//   in one step today; the review screen says so, and points at keep-worker.
+//   Giving the merge editor an explicit, stated existence choice would close
+//   that — as its own decision, not an inference.
 // ---------------------------------------------------------------------------

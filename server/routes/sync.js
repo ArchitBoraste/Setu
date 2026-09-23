@@ -109,6 +109,8 @@ function mayWrite(actor, stored) {
  * disagreement, and a supervisor resolving one leaves a phantom behind.
  */
 async function fileConflict(conn, actor, stored, incoming) {
+  const submittedDeleted = incoming.deleted ? 1 : 0;
+
   const [existing] = await conn.query(
     // submitted_deleted is part of what makes two pushes "the same push". A
     // deletion carrying the same answers as an earlier edit is a different act —
@@ -117,18 +119,20 @@ async function fileConflict(conn, actor, stored, incoming) {
     // an edit. The supervisor would be shown no deletion to decide on, and
     // keeping "the worker's version" would keep the household.
     //
-    // A current build cannot reach this: a conflicted row is read-only, so it
-    // never sends a second push to fold. An older build that still lets a worker
-    // delete a conflicted row can. Against a conflict filed before migration 002
-    // (submitted_deleted = 0, meaning "unknown"), a deletion now files its own
-    // row rather than joining that one — a second queue entry, which is the
-    // recoverable direction to be wrong in.
-    `SELECT id, payload
+    // A conflict whose value was never recorded (NULL: filed before 002, or a 0
+    // demoted by 003) matches too, and is taught the value below. Those rows
+    // carry no fact for this push to contradict, and refusing to match them
+    // would turn every retry of an older conflict — including the re-push that
+    // releases a row from the old pull-side lock — into a duplicate dispute in
+    // the supervisor's queue. A row that recorded a fact is matched only by the
+    // same fact, and is preferred when both kinds exist.
+    `SELECT id, payload, submitted_deleted AS submittedDeleted
        FROM record_conflicts
       WHERE record_id = ? AND submitted_by = ? AND device_id = ?
-        AND base_version = ? AND server_version = ? AND submitted_deleted = ?
+        AND base_version = ? AND server_version = ?
+        AND (submitted_deleted = ? OR submitted_deleted IS NULL)
         AND status = 'open'
-      ORDER BY created_at DESC
+      ORDER BY (submitted_deleted IS NULL) ASC, created_at DESC
       LIMIT 5`,
     [
       stored.id,
@@ -136,13 +140,28 @@ async function fileConflict(conn, actor, stored, incoming) {
       incoming.deviceId,
       incoming.baseVersion ?? 0,
       stored.version,
-      incoming.deleted ? 1 : 0,
+      submittedDeleted,
     ]
   );
 
   const incomingJson = canonicalJson(incoming.payload);
   const duplicate = existing.find((row) => canonicalJson(row.payload) === incomingJson);
-  if (duplicate) return duplicate.id;
+  if (duplicate) {
+    if (duplicate.submittedDeleted === null) {
+      // The same push, from the same phone and base with the same answers,
+      // arriving again — and this time the server hears whether it deleted. That
+      // is exactly the fact the row was missing, and recording it is what lets
+      // keep-worker restore (or delete) this household rather than leave it as
+      // it is for want of a value. Conditional on still being NULL, so two
+      // retries racing cannot overwrite a value one of them already wrote.
+      await conn.query(
+        `UPDATE record_conflicts SET submitted_deleted = ?
+          WHERE id = ? AND submitted_deleted IS NULL`,
+        [submittedDeleted, duplicate.id]
+      );
+    }
+    return duplicate.id;
+  }
 
   const conflictId = crypto.randomUUID();
   await conn.query(
@@ -165,12 +184,13 @@ async function fileConflict(conn, actor, stored, incoming) {
       incoming.formType,
       incoming.formVersion,
       incoming.payloadText,
-      // Whether the losing push was a deletion. The payload alone cannot say —
-      // a deleted row still carries its last answers — and without this a
-      // supervisor keeping "the worker's version" would adopt the answers and
-      // quietly drop the decision to remove the household. validateEnvelope has
+      // Whether the losing push was a deletion, ALWAYS written as 0 or 1. The
+      // payload alone cannot say — a deleted row still carries its last answers
+      // — and since migration 003 a NULL here would mean "not recorded", which
+      // keep-worker treats as "do not touch existence". A live edit filed as NULL
+      // could never restore the household it was about. validateEnvelope has
       // already required `deleted` to be a real boolean.
-      incoming.deleted ? 1 : 0,
+      submittedDeleted,
     ]
   );
   return conflictId;
@@ -685,7 +705,8 @@ function toResolutionView(row) {
     // own copy of it.
     submitted: {
       payload: row.submittedPayload,
-      deleted: row.submittedDeleted === 1,
+      // true, false, or null when not recorded — never collapsed to false.
+      deleted: row.submittedDeleted === null ? null : row.submittedDeleted === 1,
       formType: row.submittedFormType,
       formVersion: row.submittedFormVersion,
       baseVersion: row.baseVersion,

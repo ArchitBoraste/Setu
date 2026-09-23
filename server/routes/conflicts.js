@@ -3,7 +3,7 @@ import { pool } from "../db/index.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { RESOLVED_DEVICE_ID } from "../sync/pushRules.js";
-import { RESOLUTION, planResolution } from "../sync/conflictRules.js";
+import { EXISTENCE, RESOLUTION, planResolution } from "../sync/conflictRules.js";
 import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
 
 const router = express.Router();
@@ -97,6 +97,14 @@ const CONFLICT_PAGE = `
 // separate query shape — the keyset disjunct is simply dead weight on it.
 const EPOCH_CURSOR = "1970-01-01 00:00:00.000000";
 
+// The record's deleted_at after a resolution, from the plan's existence and the
+// value read under the lock.
+function deletedAtAfter(existence, currentDeletedAt, serverNow) {
+  if (existence === EXISTENCE.DELETE) return currentDeletedAt ?? serverNow;
+  if (existence === EXISTENCE.RESTORE) return null;
+  return currentDeletedAt;
+}
+
 /** The API shape. Two copies, side by side, plus who and when for each. */
 function toConflictView(row) {
   return {
@@ -115,11 +123,13 @@ function toConflictView(row) {
     // naming it "received" keeps the screen from claiming one it does not have.
     submitted: {
       payload: row.submittedPayload,
-      // The losing push was a deletion. The screen has to say so before a
-      // supervisor keeps this copy, because keeping it now deletes the record.
-      // On conflicts filed before migration 002 this is false for want of a
-      // record, not because the push was known to be an edit.
-      deleted: row.submittedDeleted === 1,
+      // Whether the losing push was a deletion: true, false, or null when it
+      // was not recorded. Three values, not two, because the screen promises
+      // different things for each — keeping a known deletion deletes the
+      // record, keeping a known live edit restores it, and keeping an unknown
+      // does neither. Collapsing null into false would have the preview promise
+      // a restore the server then refuses to carry out.
+      deleted: row.submittedDeleted === null ? null : row.submittedDeleted === 1,
       formType: row.submittedFormType,
       formVersion: row.submittedFormVersion,
       baseVersion: row.baseVersion,
@@ -378,14 +388,11 @@ router.post(
             //                 read as its own echo, and overwriting a
             //                 supervisor's judgement with nothing raised.
             //
-            //   deleted_at    set only when write.deletes — kept_client on a
-            //                 conflict whose losing push was a deletion. An
-            //                 existing tombstone keeps the moment it was first
-            //                 raised, the push route's rule. Otherwise the stored
-            //                 value is written back unchanged, read under this
-            //                 same lock: a resolution never clears a tombstone.
-            //                 See the closing note in conflictRules.js for why
-            //                 that is one-directional.
+            //   deleted_at    from write.existence — see the closing note in
+            //                 conflictRules.js. DELETE keeps an existing
+            //                 tombstone's first-raised time (the push route's
+            //                 rule); RESTORE clears it; KEEP writes back the value
+            //                 read under this same lock, unchanged.
             `UPDATE records
                 SET form_type = ?, form_version = ?, payload = CAST(? AS JSON),
                     version = ?, device_id = ?, updated_at = ?, deleted_at = ?
@@ -397,7 +404,7 @@ router.post(
               write.version,
               RESOLVED_DEVICE_ID,
               serverNow,
-              write.deletes ? (record.deletedAt ?? serverNow) : record.deletedAt,
+              deletedAtAfter(write.existence, record.deletedAt, serverNow),
               record.id,
             ]
           );
@@ -460,9 +467,13 @@ router.post(
           recordId: record.id,
           version: write ? write.version : record.version,
           recordChanged: Boolean(write),
-          // Only true when this resolution turned a live record into a
-          // tombstone, so the screen can say so rather than report a version.
-          recordDeleted: Boolean(write?.deletes) && record.deletedAt === null,
+          // Only true when this resolution actually changed whether the
+          // household exists, so the screen can say so rather than report a
+          // version number.
+          recordDeleted:
+            write?.existence === EXISTENCE.DELETE && record.deletedAt === null,
+          recordRestored:
+            write?.existence === EXISTENCE.RESTORE && record.deletedAt !== null,
           previousVersionKept: superseded !== null,
         });
       } catch (error) {

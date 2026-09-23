@@ -7,6 +7,8 @@
     "client",
     "server"
   ],
-  "scripts": {},
+  "scripts": {
+    "test": "npm test --workspaces"
+  },
   "license": "MIT"
 }

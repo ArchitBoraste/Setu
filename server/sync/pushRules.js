@@ -6,6 +6,8 @@
 // a human, or thrown away. Separated like this it can be called with three
 // literals and asserted on.
 
+import { Buffer } from "node:buffer";
+
 // ---------------------------------------------------------------------------
 // Limits
 //
@@ -15,7 +17,13 @@
 // and on per-record size, which together bound what one device can send.
 // ---------------------------------------------------------------------------
 export const MAX_BATCH_RECORDS = 200;
-export const MAX_PAYLOAD_BYTES = 64 * 1024;
+
+// Real UTF-8 bytes of the payload's JSON text — what the JSON column stores —
+// not JavaScript string length. The two differ by up to 3x for exactly the
+// text this app exists to collect: a Devanagari character is one UTF-16 unit
+// and three UTF-8 bytes. Sized so a 65,536-character Devanagari payload
+// (about 196 KB) still fits.
+export const MAX_PAYLOAD_UTF8_BYTES = 256 * 1024;
 export const MAX_PAYLOAD_FIELDS = 200;
 export const MAX_STRING_LENGTH = 10_000;
 export const MAX_FORM_TYPE_LENGTH = 64; // matches records.form_type VARCHAR(64)
@@ -71,9 +79,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 // carry whitespace, punctuation, or anything that reads as markup downstream.
 const FORM_TYPE_RE = /^[a-z0-9_]{1,64}$/;
 
+// The only two shapes a date may take: a calendar date, or that date with a
+// time of day (seconds, fraction and offset optional). The groups capture the
+// date and each clock field so isRealDate can range-check them.
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const ISO_DATETIME_RE =
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?(Z|[+-]\d{2}:\d{2})?$/;
+  /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,6})?)?(?:Z|[+-](\d{2}):(\d{2}))?$/;
 
 /**
  * Stable JSON: object keys sorted, at every depth.
@@ -174,16 +185,40 @@ function validateDeclaredField(key, value, type) {
     : `field "${key}" must be a string, not a ${typeof value}`;
 }
 
+/**
+ * A strict ISO 8601 date or date-time that names a moment which exists.
+ *
+ * Date.parse is never the judge of shape. V8 accepts almost anything — "5" is a
+ * day in 2001, "09/22/2026" is a US-style date — so a string must match one of
+ * the two ISO shapes above before its values are even looked at.
+ */
 function isRealDate(text) {
-  if (ISO_DATE_RE.test(text)) {
-    // Date.parse reads a date-only ISO string as UTC midnight, so a valid one
-    // round-trips exactly. "2026-02-30" and "2026-13-01" do not parse at all.
-    const parsed = new Date(text);
-    return (
-      !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === text
-    );
-  }
-  return !Number.isNaN(Date.parse(text));
+  if (ISO_DATE_RE.test(text)) return isCalendarDate(text);
+
+  const parts = ISO_DATETIME_RE.exec(text);
+  if (!parts) return false;
+
+  const [, date, hours, minutes, seconds = "00", offsetHours = "00", offsetMinutes = "00"] =
+    parts;
+  // Checked by hand rather than by parsing: V8 rolls "24:00" over into the next
+  // day instead of refusing it, the same way it rolls impossible dates forward.
+  return (
+    isCalendarDate(date) &&
+    Number(hours) <= 23 &&
+    Number(minutes) <= 59 &&
+    Number(seconds) <= 59 &&
+    Number(offsetHours) <= 23 &&
+    Number(offsetMinutes) <= 59
+  );
+}
+
+// new Date() reads a date-only ISO string as UTC midnight, so a real date
+// round-trips exactly. The round trip is what refuses an impossible one: V8
+// does not reject "2026-02-30" but rolls it forward to 2 March, and only a
+// month that cannot exist at all, such as "2026-13-01", fails to parse.
+function isCalendarDate(text) {
+  const parsed = new Date(text);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === text;
 }
 
 function validatePayloadValue(key, value) {
@@ -251,11 +286,11 @@ export function validatePayload(formType, formVersion, payload) {
   }
 
   const text = JSON.stringify(payload);
-  if (text.length > MAX_PAYLOAD_BYTES) {
+  if (Buffer.byteLength(text, "utf8") > MAX_PAYLOAD_UTF8_BYTES) {
     return {
       error: {
         reason: REJECT_REASON.TOO_LARGE,
-        message: `payload is larger than ${MAX_PAYLOAD_BYTES} bytes`,
+        message: `payload is larger than ${MAX_PAYLOAD_UTF8_BYTES} bytes`,
       },
     };
   }

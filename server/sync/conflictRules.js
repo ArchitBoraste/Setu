@@ -211,6 +211,26 @@ function existenceFromLosingPush(submittedDeleted) {
   return EXISTENCE.KEEP;
 }
 
+/**
+ * The record's deleted_at after a resolution, from the plan's existence and the
+ * value read under the lock.
+ *
+ * DELETE keeps an existing tombstone's time, the push route's rule: a device
+ * that already applied the deletion must not see it arrive again as a newer
+ * event. Anything that is not DELETE or RESTORE writes back exactly what was
+ * read — an unrecognised value falls to "do nothing", like an unknown
+ * submitted_deleted does above.
+ *
+ * @param {string}      existence         one of EXISTENCE
+ * @param {string|null} currentDeletedAt  the record's deleted_at, read under the lock
+ * @param {string}      serverNow         this resolution's single clock reading
+ */
+export function deletedAtAfter(existence, currentDeletedAt, serverNow) {
+  if (existence === EXISTENCE.DELETE) return currentDeletedAt ?? serverNow;
+  if (existence === EXISTENCE.RESTORE) return null;
+  return currentDeletedAt;
+}
+
 // ---------------------------------------------------------------------------
 // WHEN A RESOLUTION DECIDES WHETHER THE RECORD EXISTS — AND WHEN IT DOES NOT.
 //

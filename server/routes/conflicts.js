@@ -3,7 +3,12 @@ import { pool } from "../db/index.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { RESOLVED_DEVICE_ID } from "../sync/pushRules.js";
-import { EXISTENCE, RESOLUTION, planResolution } from "../sync/conflictRules.js";
+import {
+  EXISTENCE,
+  RESOLUTION,
+  deletedAtAfter,
+  planResolution,
+} from "../sync/conflictRules.js";
 import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
 
 const router = express.Router();
@@ -96,14 +101,6 @@ const CONFLICT_PAGE = `
 // Sorts before every value DATE_FORMAT can produce, so the first page needs no
 // separate query shape — the keyset disjunct is simply dead weight on it.
 const EPOCH_CURSOR = "1970-01-01 00:00:00.000000";
-
-// The record's deleted_at after a resolution, from the plan's existence and the
-// value read under the lock.
-function deletedAtAfter(existence, currentDeletedAt, serverNow) {
-  if (existence === EXISTENCE.DELETE) return currentDeletedAt ?? serverNow;
-  if (existence === EXISTENCE.RESTORE) return null;
-  return currentDeletedAt;
-}
 
 /** The API shape. Two copies, side by side, plus who and when for each. */
 function toConflictView(row) {

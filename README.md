@@ -205,8 +205,8 @@ CREATE DATABASE setu CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 
 **3. Load the tables:**
 
-```bash
-mysql -u root -p setu < server/db/schema.sql
+```powershell
+Get-Content server/db/schema.sql | mysql -u root -p setu
 ```
 
 **4. Make your `server/.env` file** by copying `server/.env.example` and filling in your own MySQL password.
@@ -219,6 +219,8 @@ npm run dev -w client    # http://localhost:5173
 ```
 
 Open `http://localhost:5173`. If the setup is right, the page shows the JSON coming from the server and the server terminal prints `MySQL connected`.
+
+**Tests:** run `npm test` from the root folder to run the server and client unit tests together (Node's built-in test runner; no database, browser or `.env` needed).
 
 ---
 

@@ -102,7 +102,7 @@ export default defineConfig({
       // port (5000) rather than the React port (5173). It's a standard practice to prevent backends from rejecting the request.
       
       "/api": {
-        target: "http://localhost:5000",
+        target: "http://127.0.0.1:5000",
         changeOrigin: true,
       },
     },

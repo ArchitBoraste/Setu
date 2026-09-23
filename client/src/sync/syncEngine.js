@@ -13,6 +13,7 @@ import {
   RESOLUTION_ACTION,
   classifyPulledRow,
   classifyResolution,
+  releaseLegacyDeletionLock,
 } from "./pullRules.js";
 
 // The only file in client/src that talks to the server about records. Capture
@@ -468,16 +469,15 @@ async function applyPulledPage(user, records, summary) {
         continue;
       }
 
-      if (action === PULL_ACTION.DELETE_CONFLICT) {
-        // The worker's row is left exactly as it is; only its state changes, and
-        // the server's tombstone is stored beside it so the comparison view can
-        // show what happened. This takes the row out of the push queue, which is
-        // what stops the device recreating a record somebody deleted on purpose.
-        await db.records.update(remote.id, {
-          syncState: SYNC_STATE.CONFLICT,
-          serverConflict: remote,
-        });
-        summary.pullConflicts += 1;
+      if (action === PULL_ACTION.KEEP_LOCAL_DELETED) {
+        // The worker's row stays exactly as it is — payload, syncedVersion, and
+        // above all syncState, so it stays in the push queue. Only the server's
+        // tombstone is stored beside it, so the worker is told the record was
+        // deleted and that their copy is going to a supervisor. The next push
+        // files the conflict on the server; see the tombstone case in
+        // pullRules.js for why that push cannot undo the deletion.
+        await db.records.update(remote.id, { serverConflict: remote });
+        summary.deletedOnServer += 1;
         continue;
       }
 
@@ -551,6 +551,10 @@ function toResolutionNotice(user, resolution, discarded) {
     // kept your version" is false for the second, and telling somebody their
     // data won when it was never in question is how a notice stops being read.
     submittedByMe: resolution.submitted?.byId === user.userId,
+    // Whether the copy under judgement was itself a deletion. "A supervisor kept
+    // your version" is only a complete sentence when that version and the
+    // record's current state agree about whether the household still exists.
+    submittedDeleted: resolution.submitted?.deleted === true,
     discardedPayload: discarded ? discarded.payload : null,
     discardedVersion: discarded ? discarded.version : null,
     supersededPayload: showSuperseded ? superseded.payload : null,
@@ -680,6 +684,36 @@ async function pullRecords(user, summary, { since, until }) {
 }
 
 /**
+ * Frees this user's rows still held by the old pull-side lock, now that the
+ * window's resolutions have had their chance to adopt the real ones. See
+ * releaseLegacyDeletionLock() in pullRules.js.
+ *
+ * Only the signed-in user's rows: the lock is released into the push queue, and
+ * the push queue is per user. Another worker's flagged rows wait for them.
+ */
+async function releaseLegacyDeletionLocks(user, summary) {
+  await db.transaction("rw", db.records, async () => {
+    const locked = await db.records
+      .where("[createdBy+syncState]")
+      .equals([user.userId, SYNC_STATE.CONFLICT])
+      .toArray();
+
+    for (const row of locked) {
+      const releaseTo = releaseLegacyDeletionLock(row);
+      if (!releaseTo) continue;
+
+      await db.records.update(row.id, {
+        syncState: releaseTo,
+        // Dexie's update() removes a key set to undefined, so the flag is gone
+        // rather than left false for something to misread later.
+        legacyDeletionLock: undefined,
+      });
+      summary.legacyLocksReleased += 1;
+    }
+  });
+}
+
+/**
  * Both halves of the delta window — resolutions, then records — and only then
  * the signed-in user's cursor.
  *
@@ -704,6 +738,12 @@ async function pullChanges(user, summary) {
   if (!until) return;
 
   await pullRecords(user, summary, { since, until });
+
+  // After BOTH halves, never before the resolutions: a flagged row that was a
+  // real conflict already decided on the server must be adopted by its
+  // resolution, not re-pushed into a second dispute. Released rows go up with
+  // the next sync's push — one push phase per sync, before the pull, as always.
+  await releaseLegacyDeletionLocks(user, summary);
 
   // Only forward. resolveWindow() already refuses to hand back an edge below
   // the cursor it was given, but a cursor that moves backwards re-delivers what
@@ -731,6 +771,11 @@ function emptySummary() {
     received: 0,
     heldBack: 0,
     pullConflicts: 0,
+    // Rows the server deleted while this device held unsent work for them. Kept
+    // queued; the next push files each as a conflict for a supervisor.
+    deletedOnServer: 0,
+    // Rows freed from the old pull-side lock, back in the queue for next sync.
+    legacyLocksReleased: 0,
     pullPages: 0,
     // Resolutions. `applied` are rows that LEFT conflict state and rejoined
     // normal operation — the deadlock exit actually firing. `noticed` are rows

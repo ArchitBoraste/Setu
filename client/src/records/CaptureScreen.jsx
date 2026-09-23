@@ -240,14 +240,21 @@ function ConflictCompare({ record }) {
 // losing copy — "a supervisor kept your version" would simply be untrue to them,
 // and a notice that tells somebody something they know to be wrong is a notice
 // they stop reading.
-function resolutionHeadline({ resolution, submittedByMe }) {
+function resolutionHeadline({ resolution, submittedByMe, submittedDeleted }, record) {
   if (resolution === "merged") {
     return "A supervisor combined both versions of this record, field by field.";
   }
   if (resolution === "kept_client") {
-    return submittedByMe
-      ? "A supervisor kept your version of this record."
-      : "A supervisor replaced this record with another worker's version.";
+    if (!submittedByMe) {
+      return "A supervisor replaced this record with another worker's version.";
+    }
+    // Keeping a worker's live copy never restores a deleted record (see the
+    // closing note in server/sync/conflictRules.js). "Kept your version" on its
+    // own would tell the worker their household is back in the register when it
+    // is not — so the answers and the deletion are named separately.
+    return record.deletedAt && !submittedDeleted
+      ? "A supervisor kept your answers, but the record stays deleted."
+      : "A supervisor kept your version of this record.";
   }
   if (resolution === "kept_server") {
     return submittedByMe
@@ -283,7 +290,7 @@ function ResolutionNotice({ record, onDismiss, busy }) {
 
   return (
     <div style={styles.resolved}>
-      <strong>{resolutionHeadline(notice)}</strong>{" "}
+      <strong>{resolutionHeadline(notice, record)}</strong>{" "}
       <span style={styles.muted}>
         {notice.resolvedByName ? `${notice.resolvedByName}, ` : ""}
         {shortTime(notice.resolvedAt) ?? "recently"} (server time)
@@ -370,8 +377,11 @@ function ResolutionNotice({ record, onDismiss, busy }) {
 function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onToggle }) {
   const isConflict = record.syncState === SYNC_STATE.CONFLICT;
   const isRejected = record.syncState === SYNC_STATE.REJECTED;
+  const isPending = record.syncState === SYNC_STATE.PENDING;
   // The server's copy is a tombstone while this device still holds the row.
-  const serverDeleted = isConflict && record.serverConflict?.deletedAt != null;
+  const serverDeleted = record.serverConflict?.deletedAt != null;
+  // Held by the old pull-side lock, not yet released. See the v6 upgrade.
+  const awaitingRelease = isConflict && record.legacyDeletionLock === true;
 
   return (
     <li style={styles.row}>
@@ -391,8 +401,10 @@ function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onTogg
           {serverDeleted ? (
             <>
               This record was <strong>deleted on the server</strong> while your
-              changes were still on this phone. Your copy has been kept and will
-              not be sent back until someone decides which is right.
+              changes were still on this phone. Your copy is kept.{" "}
+              {awaitingRelease
+                ? "On your next sync it goes to a supervisor, who decides whether the record stays deleted."
+                : "It has gone to a supervisor, who decides whether the record stays deleted."}
             </>
           ) : (
             <>
@@ -408,6 +420,20 @@ function RecordRow({ record, onEdit, onDelete, onDismiss, busy, expanded, onTogg
       )}
 
       {isConflict && expanded && <ConflictCompare record={record} />}
+
+      {(isPending || isRejected) && serverDeleted && (
+        <p style={styles.muted}>
+          {/* The one moment this used to go silent and then lock for good. The
+              row is still unsent work — editable, queued — and the worker needs
+              to know two things: that the record was deleted, and that their
+              copy is not being thrown away but sent to someone who decides. */}
+          This record was <strong>deleted on the server</strong> while your
+          changes were still on this phone. Your copy is kept.{" "}
+          {isPending
+            ? "On your next sync it goes to a supervisor, who decides whether the record stays deleted."
+            : "Once you fix it, it goes to a supervisor, who decides whether the record stays deleted."}
+        </p>
+      )}
 
       <ResolutionNotice record={record} onDismiss={onDismiss} busy={busy} />
 
@@ -529,6 +555,12 @@ function SyncNotice({ summary }) {
   }
   if (summary.pullConflicts) parts.push(`${summary.pullConflicts} needs review`);
   if (summary.heldBack) parts.push(`${summary.heldBack} kept local`);
+  if (summary.deletedOnServer) {
+    parts.push(`${summary.deletedOnServer} deleted on the server, your copy goes for review next sync`);
+  }
+  if (summary.legacyLocksReleased) {
+    parts.push(`${summary.legacyLocksReleased} unlocked, goes for review next sync`);
+  }
 
   // Counted apart from "received" and "updated". A record leaving conflict
   // because a person decided about it is not the same event as a record

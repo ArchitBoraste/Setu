@@ -116,6 +116,33 @@ db.version(5).upgrade((tx) =>
   tx.table("meta").bulkDelete(["syncCursor", "serverSyncedAt", "lastSyncAt"])
 );
 
+// Version 6 finds rows the old pull-side lock may have trapped.
+//
+// Until this release, a pull that found a record deleted on the server while the
+// phone held an unsent or rejected edit to it moved the row to CONFLICT on the
+// spot — with no conflict on the server. Conflicted rows are read-only and never
+// pushed, so no supervisor could see it and no resolution could ever arrive: a
+// household visit locked on one phone, and nowhere else.
+//
+// Every row that COULD be one is flagged, not released here. The old lock left
+// nothing to tell it apart from a real conflict filed against a deleted record,
+// and releasing a real one before this device has pulled its resolution would
+// re-push it into a second dispute about something a supervisor already
+// decided. So the flag is released by the sync, AFTER the window's resolutions
+// have been applied — see releaseLegacyDeletionLock() in sync/pullRules.js.
+db.version(6).upgrade((tx) =>
+  tx
+    .table("records")
+    .toCollection()
+    .modify((row) => {
+      // A literal, not SYNC_STATE.CONFLICT: an upgrade describes the data as it
+      // was stored then, and must not change meaning if the constant is renamed.
+      if (row.syncState === "conflict" && row.serverConflict?.deletedAt != null) {
+        row.legacyDeletionLock = true;
+      }
+    })
+);
+
 // Fired when another tab running newer code wants to upgrade the schema. Until
 // this tab closes the database, that upgrade is blocked and the new tab hangs on
 // an unopened database. Closing here unblocks it; this tab's own queries then

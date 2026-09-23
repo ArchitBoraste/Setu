@@ -53,7 +53,7 @@ Sync
 Conflicts
 - A conflicted row cannot be edited or deleted on the device — allowing it re-queues the row against its stale base and restarts the conflict loop.
   Mitigation: resolving the conflict makes the row editable again so the worker can delete it; a resolution itself deletes only when the losing push was a deletion (`submitted_deleted`).
-- A row locked by the pull (the server deleted it while the phone held a rejected or unsent edit) has no conflict on the server, so no resolution can ever unlock it.
+- A resolution never restores a deleted record, because `submitted_deleted = 0` cannot tell "was a live edit" from "filed before 002": keeping a worker's live copy against a server deletion leaves the household deleted with their answers inside the tombstone, and nothing in the app can restore it.
 - A worker who dismisses a resolution notice loses the only view they have of the earlier version; it survives in `record_conflicts`, readable by supervisors, not by them.
 
 ## Working style

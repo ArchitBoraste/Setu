@@ -20,8 +20,10 @@ export const PULL_ACTION = {
   // Local row is already in conflict: refresh the server copy shown beside it,
   // and resolve nothing.
   REFRESH_CONFLICT: "refresh_conflict",
-  // The server deleted a row this device has unsent edits for. Raise it.
-  DELETE_CONFLICT: "delete_conflict",
+  // The server deleted a record this device holds unsent work for. Keep the
+  // work queued exactly as it is and note the deletion beside it; the next push
+  // raises the conflict ON THE SERVER, where it can be resolved.
+  KEEP_LOCAL_DELETED: "keep_local_deleted",
   // Already applied; the row arrived again inside an overlapping window.
   SKIP: "skip",
 };
@@ -62,23 +64,41 @@ export function classifyPulledRow(local, remote) {
     //                      it ever existed. This is the harm the whole project
     //                      is built to prevent.
     //
-    //   ignore the delete  silently overrides a deliberate act. Records get
-    //                      deleted because a household withdrew consent, or was
-    //                      entered twice, or was the wrong family — and the
-    //                      device would push the row straight back, undoing the
-    //                      deletion without telling anybody it had.
+    //   ignore the delete  overrides a deliberate act without anybody seeing.
+    //                      Records get deleted because a household withdrew
+    //                      consent, or was entered twice, or was the wrong
+    //                      family.
     //
-    // So neither side decides. The row is raised as a conflict, which preserves
-    // both facts — the worker's edit and the server's deletion — and hands the
-    // choice to a person, which is what step 12 exists for.
+    // So neither side decides here, and — this is the part that changed — the
+    // DEVICE does not declare a conflict either. It used to: the row was moved to
+    // CONFLICT on the spot. But a conflict the server has no row for is one no
+    // supervisor can see and no resolution can ever close, and since conflicted
+    // rows became read-only that lock was permanent — around a household visit
+    // that existed on this phone and nowhere else.
     //
-    // The property that makes this safe rather than merely undecided: CONFLICT
-    // is not PENDING, and the push queue selects only PENDING rows. Moving the
-    // row here takes it out of the push queue, so the device will NOT recreate
-    // the deleted record on the server while the question is open. It stops the
-    // resurrection without destroying the work.
+    // The lock was also never what protected the deletion. The server's version
+    // comparison is. This row's push carries base = syncedVersion, which predates
+    // the deletion, so it arrives BEHIND the tombstone. An accept needs either
+    // base == stored.version, which it is not, or the echo rule — which needs
+    // this phone to be the tombstone's author, and a phone cannot author a
+    // deletion while holding a live unsent edit to the same row, because nothing
+    // on it can undelete. A tombstone written by a resolution carries
+    // RESOLVED_DEVICE_ID, which the echo rule refuses outright. Every such push
+    // is therefore filed as a conflict: a real record_conflicts row, in the
+    // supervisor's queue, resolvable three ways like any other — keeping the
+    // deletion among them.
+    //
+    // So the work stays queued exactly as it is, and the tombstone is noted
+    // beside it so the worker is told. Nothing loops: the row only becomes
+    // CONFLICT when the server files one, and from then on it is read-only.
+    //
+    // Why the push has not already raised it: sync pushes before it pulls, so in
+    // the ordinary case it has. The row reaches this branch only when that push
+    // did not land — it failed, or the worker edited the row while it was in the
+    // air — or when the row was REJECTED, in which case it waits for the worker
+    // to fix it and then goes the same way.
     if (remote.deletedAt !== null) {
-      return { action: PULL_ACTION.DELETE_CONFLICT };
+      return { action: PULL_ACTION.KEEP_LOCAL_DELETED };
     }
 
     // An ordinary edit landing on top of unsent local work.
@@ -283,4 +303,42 @@ export function classifyResolution(local, resolution, deviceId) {
   return heldReplacedVersion(local, resolution)
     ? { action: RESOLUTION_ACTION.NOTIFY }
     : { action: RESOLUTION_ACTION.SKIP };
+}
+
+// ---------------------------------------------------------------------------
+// ROWS ALREADY STUCK IN THE OLD LOCK
+//
+// Phones running a build from step 12 up to this fix may hold rows the pull
+// moved to CONFLICT with no conflict on the server. The v6 Dexie upgrade flags
+// every row that COULD be one (legacyDeletionLock), and each sync releases the
+// flagged rows still locked once its resolutions have been applied.
+//
+// "Could be", because the flag is not proof. The old lock left a row exactly as
+// a real conflict does — CONFLICT, with the server's tombstone beside it — and a
+// real conflict filed against a deleted record looks the same. Releasing a real
+// one is harmless: its re-push carries the same device, base and payload, and
+// fileConflict folds it back into the open conflict it already has. That is also
+// why the release waits for the resolutions half: a real conflict already
+// RESOLVED on the server is adopted there and loses the flag, instead of being
+// re-pushed into a second dispute after a supervisor has already decided.
+// ---------------------------------------------------------------------------
+
+/**
+ * The state a flagged, still-locked row returns to, or null to leave it alone.
+ *
+ * Back to the state the lock took it from. A REJECTED row goes back to REJECTED:
+ * its payload was refused, and pushing it would only be refused again — it
+ * waits for the worker to fix it, and then escalates like any other. The lock
+ * never cleared syncError, while a push that files a real conflict always does,
+ * so a syncError on a locked row is how a REJECTED origin is recognised.
+ * Anything else goes back to PENDING, into the push queue, where the next push
+ * files it on the server.
+ *
+ * @param {object|null} local  the Dexie row, or null
+ */
+export function releaseLegacyDeletionLock(local) {
+  if (!local || local.syncState !== SYNC_STATE.CONFLICT || !local.legacyDeletionLock) {
+    return null;
+  }
+  return local.syncError ? SYNC_STATE.REJECTED : SYNC_STATE.PENDING;
 }

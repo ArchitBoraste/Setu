@@ -6,8 +6,8 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import {
   signAccessToken,
   issueRefreshToken,
-  findValidRefreshToken,
-  revokeRefreshToken,
+  rotateRefreshToken,
+  revokeRefreshFamily,
 } from "../utils/tokens.js";
 
 const router = express.Router();
@@ -75,9 +75,12 @@ router.post(
     // a separate hash for this device to check against when there is no network
     const offlineHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
+    // A sign-in starts a new token family: the session that sign-out ends.
+    const { token: refreshToken } = await issueRefreshToken(user.id);
+
     res.json({
       accessToken: signAccessToken(user),
-      refreshToken: await issueRefreshToken(user.id),
+      refreshToken,
       offlineHash,
       profile: toProfile(user),
     });
@@ -93,22 +96,25 @@ router.post(
       return res.status(400).json({ error: "Missing token" });
     }
 
-    const row = await findValidRefreshToken(refreshToken);
-    if (!row) return res.status(401).json({ error: "Invalid refresh token" });
-
     // rotate: the old token dies the moment it is used, so a stolen copy is
-    // useless once the real user refreshes
-    await revokeRefreshToken(refreshToken);
-
-    const user = {
-      id: row.userId,
-      role: row.role,
-      organizationId: row.organizationId,
-    };
+    // useless once the real user refreshes. Check, revoke and re-issue are one
+    // transaction, so two refreshes racing with the same token cannot both win.
+    //
+    // Presenting a token that was already rotated is taken as theft and ends
+    // the whole session, the winner's new token included. That covers the
+    // loser of such a race too: two browser tabs refreshing at the same moment
+    // sign the user out. The client shares one refresh within a tab, not
+    // across tabs.
+    //
+    // Reuse, expiry, sign-out and an unknown token all get the same 401, so
+    // the answer never tells a caller which tokens exist or what became of
+    // them.
+    const rotated = await rotateRefreshToken(refreshToken);
+    if (!rotated) return res.status(401).json({ error: "Invalid refresh token" });
 
     res.json({
-      accessToken: signAccessToken(user),
-      refreshToken: await issueRefreshToken(user.id),
+      accessToken: signAccessToken(rotated.user),
+      refreshToken: rotated.token,
     });
   })
 );
@@ -117,7 +123,10 @@ router.post(
   "/logout",
   asyncHandler(async (req, res) => {
     const { refreshToken } = req.body ?? {};
-    if (isNonEmptyString(refreshToken)) await revokeRefreshToken(refreshToken);
+    // The whole session, not just the token presented, so a successor that a
+    // refresh still in flight has just minted cannot outlive the sign-out. 200
+    // whether or not the token matched anything, so this cannot test tokens.
+    if (isNonEmptyString(refreshToken)) await revokeRefreshFamily(refreshToken);
     res.json({ success: true });
   })
 );

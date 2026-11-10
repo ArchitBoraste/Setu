@@ -61,16 +61,27 @@ CREATE TABLE users (
 ) ENGINE=InnoDB;
 
 -- Long-lived refresh tokens. Access tokens stay short-lived and are never stored.
+-- Each sign-in is a family of tokens, one per rotation, so a session can be
+-- revoked whole. See migrations/005_refresh_token_families.sql.
 CREATE TABLE refresh_tokens (
   id          CHAR(36)     NOT NULL,
   user_id     CHAR(36)     NOT NULL,
+  -- The sign-in this token belongs to: the id of the family's first token.
+  -- No default, so every insert has to say which session it continues.
+  family_id   CHAR(36)     NOT NULL,
   token_hash  CHAR(64)     NOT NULL,              -- SHA-256 of the token, not the token itself
   expires_at  DATETIME(3)  NOT NULL,
   revoked_at  DATETIME(3)  NULL,
+  -- The token minted when this one was rotated; NULL if it never was. Not a
+  -- foreign key: an audit pointer, and a self-reference would make deleting a
+  -- user's tokens order-dependent.
+  replaced_by CHAR(36)     NULL,
   created_at  DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   PRIMARY KEY (id),
   UNIQUE KEY uq_refresh_hash (token_hash),
   KEY idx_refresh_user (user_id),
+  -- Sign-out revokes every token sharing one family_id.
+  KEY idx_refresh_family (family_id),
   CONSTRAINT fk_refresh_user FOREIGN KEY (user_id)
     REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB;

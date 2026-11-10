@@ -213,7 +213,10 @@ Get-Content server/db/schema.sql | mysql -u root -p setu
 
 ```powershell
 Get-Content server/db/migrations/004_areas.sql | mysql -u root -p setu
+Get-Content server/db/migrations/005_refresh_token_families.sql | mysql -u root -p setu
 ```
+
+Stop the server before running 005: the old code inserts refresh tokens without a `family_id`, which fails once the column is `NOT NULL`.
 
 **4. Make your `server/.env` file** by copying `server/.env.example` and filling in your own MySQL password.
 

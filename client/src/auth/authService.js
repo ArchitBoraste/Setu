@@ -1,6 +1,7 @@
 import bcrypt from "bcryptjs";
 import { db, getAuthRow } from "../db/index.js";
 import { apiFetch, ApiError, NetworkError } from "../lib/api.js";
+import { normalisePhoneInput } from "../lib/phone.js";
 import { ensurePersistentStorage } from "../lib/storage.js";
 
 // How long a hash cached from an online login keeps working offline. A lost or
@@ -178,6 +179,12 @@ function toUserFacingError(error) {
   if (error instanceof ApiError && error.status === 401) {
     return new AuthError("Incorrect phone number or password.");
   }
+  // Shown exactly as the server words it, because only the server knows how
+  // long the wait is ("Try again in 12 minutes"). The message is written for
+  // the person signing in and says nothing about the account.
+  if (error instanceof ApiError && error.status === 429) {
+    return new AuthError(error.message);
+  }
   if (error instanceof ApiError) {
     return new AuthError(`Sign-in failed: ${error.message}`);
   }
@@ -189,7 +196,9 @@ function toUserFacingError(error) {
  * could not be reached. Resolves to { user, mode: "online" | "offline" }.
  */
 export async function login(phone, password) {
-  const credentials = { phone: phone.trim(), password };
+  // Normalised once, here, so the online and offline paths below compare the
+  // same string. See lib/phone.js.
+  const credentials = { phone: normalisePhoneInput(phone), password };
   if (!credentials.phone || !credentials.password) {
     throw new AuthError("Enter your phone number and password.");
   }
@@ -203,6 +212,10 @@ export async function login(phone, password) {
     // disabled or the password changed since this device cached its hash. The
     // stale hash would still accept the old password, so falling back would
     // override the server and let a removed worker back in.
+    // A 429 must not fall back either. The server is up and refusing to check
+    // any password for this number; checking it against the cached hash
+    // instead would swap the server's five guesses per 15 minutes for the
+    // device's own lockout, which allows five a minute.
     if (error instanceof NetworkError) {
       return { user: await loginOffline(credentials), mode: "offline" };
     }

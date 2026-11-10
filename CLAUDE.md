@@ -51,8 +51,11 @@ No code in `client/src` may assume the internet exists. If a feature breaks when
 ## Known gaps (do not "fix" silently — raise them first)
 
 Auth
-- No rate limit on `POST /api/auth/login`.
-- Login is not constant-time: a missing user skips bcrypt and returns much faster than a wrong password, which leaks which phone numbers are registered.
+- The login rate limit (`server/utils/loginLimiter.js`) is in memory and per process. A restart forgets every count, and several server processes would each allow their own five tries per number. Running more than one process needs a shared store first.
+- Anyone who knows a worker's phone number can lock it out of online sign-in for 15 minutes with five wrong passwords, and do it again as soon as it lifts. The device does not fall back to offline sign-in on a 429, only when the server is unreachable.
+- The global cap (100 failed logins a minute, across all numbers) refuses every online sign-in while it is engaged, correct passwords included. Anyone who can reach the API can trigger it, and it lifts within a minute of the flood stopping.
+- Login accepts only ASCII digits (optional leading `+`) and answers anything else with 400. `users.phone` uses `utf8mb4_0900_ai_ci`, which matches Devanagari or fullwidth digits to the ASCII number, so allowing them would give one account endless spellings, each with its own rate-limit count. A keyboard typing Marathi digits used to sign in online by that accident and now cannot. Phones must be stored as ASCII digits.
+- The dummy hash compared for unknown phone numbers is made at `BCRYPT_ROUNDS` in `routes/auth.js`. If the cost stored accounts are hashed at (`db/demoData.js`) ever differs, unknown and registered numbers become distinguishable by timing again.
 - On a shared phone, a second worker cannot sync the first worker's unsent changes and can wipe them via Remove account; the screen warns but cannot prevent it. Those rows are also locked against the second worker's edits until the first worker syncs.
 - Role is read from the JWT, so a supervisor demoted to field worker keeps organisation scope until their access token expires (up to 15 minutes). Area, by contrast, is read from the database on every request.
 

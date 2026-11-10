@@ -65,7 +65,10 @@ function LoginForm({ onSubmit, busy }) {
         <input
           style={styles.field}
           type="tel"
-          autoComplete="username"
+          // A digits-only keypad on phones. Stored numbers carry no "+",
+          // so nothing a worker needs is missing from it.
+          inputMode="numeric"
+          autoComplete="tel"
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
         />

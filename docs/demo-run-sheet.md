@@ -210,9 +210,9 @@ one. A Cloudflare quick tunnel gives the preview a public HTTPS address.
   stranded on the phone. Do not restart the tunnel mid-demo. Between
   rehearsals, restarting it is a quick way to give the phones fresh storage.
 - **While the tunnel runs, the API is on the public internet.** Anyone with the
-  address can reach the login with the demo passwords in this sheet (there is
-  no login rate limit). Press **Ctrl+C** in the cloudflared terminal as soon as
-  the demo ends.
+  address can reach the login with the demo passwords in this sheet (the rate
+  limit slows guessing, but these passwords are printed here). Press **Ctrl+C**
+  in the cloudflared terminal as soon as the demo ends.
 
 ---
 
@@ -248,3 +248,4 @@ after a rebuild.)
 | B syncs and gets **"1 sent"**, not a conflict | B reconnected before A had synced (or A never edited). Reset and run again. |
 | A row says *locked: … changed this on this phone* | Another worker's unsent change on the same browser. That worker has to sign in there and sync. |
 | *"Sign in to sync"* | This browser signed in offline, or the server was reset. Sign out and sign in again while online. |
+| Sign-in says *"Too many attempts. Try again in N minutes."* | Five wrong passwords for that number in 15 minutes. Wait, or restart the server (**Ctrl+C**, then `npm start -w server`): the counts live in memory and a restart forgets them. `demo:reset` does not. |

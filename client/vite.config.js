@@ -106,6 +106,10 @@ export default defineConfig({
   plugins: [react(), pwa],
   server: {
     port: 5173,
+    // Fail instead of drifting to 5174 when something else holds 5173: a
+    // silently moved port is a different origin, with its own empty IndexedDB
+    // and a CORS origin the server does not expect.
+    strictPort: true,
     proxy: API_PROXY,
   },
   // Named explicitly although Vite would fall back to server.proxy. The offline
@@ -113,6 +117,19 @@ export default defineConfig({
   // build precaches the whole app shell, and a preview that stopped proxying
   // /api would make every sync look like "offline" for the wrong reason.
   preview: {
+    // IPv4 on purpose. "localhost" resolves to [::1] on this machine, and the
+    // Cloudflare tunnel (cloudflared --url http://127.0.0.1:4173) connects over
+    // IPv4 only, so it would find nothing listening.
+    host: "127.0.0.1",
+    // The tunnel points at this exact port; a preview that moved to 4174 would
+    // leave phones on a tunnel to nothing.
+    port: 4173,
+    strictPort: true,
+    // Vite rejects requests whose Host header it does not recognise (protection
+    // against DNS rebinding). cloudflared forwards the public Host, e.g.
+    // <random>.trycloudflare.com, which changes on every tunnel start, so allow
+    // the whole domain. localhost and IP addresses are always allowed.
+    allowedHosts: [".trycloudflare.com"],
     proxy: API_PROXY,
   },
 });

@@ -61,8 +61,8 @@ work offline"** under the sign-in form (the service worker has cached the app),
 then press **F5** once.
 
 *Fallback if you are short a browser:* `http://localhost:4173` and
-`http://[::1]:4173` are different origins, so they get separate storage even
-in the same Chrome profile.
+`http://127.0.0.1:4173` are different origins, so they get separate storage
+even in the same Chrome profile. (Not `[::1]`: preview listens on IPv4 only.)
 
 ### How to go offline and back online
 
@@ -171,6 +171,48 @@ date". If it does, press **Sync now** again.
 In any worker's browser: Network → **Offline**, then press **F5**. The app
 still loads (from the service worker), still signed in, with the records list
 read from the phone's own database.
+
+---
+
+## Demo on real devices
+
+Two phones play Worker A and Worker B; the laptop plays the Supervisor. Phones
+must load the app over **HTTPS**: the service worker, persistent storage and
+`crypto.randomUUID` all need a secure context, and `http://<laptop-ip>` is not
+one. A Cloudflare quick tunnel gives the preview a public HTTPS address.
+
+> **The laptop never goes offline.** It runs the server and the tunnel, so
+> airplane mode on the laptop takes both phones offline too. The Supervisor
+> stays online in the script anyway.
+
+1. Do section 0, steps 1–6. The preview must report `http://127.0.0.1:4173`.
+   If it says the port is in use, free 4173; do not change the port.
+2. Third terminal:
+   ```powershell
+   cloudflared tunnel --url http://127.0.0.1:4173
+   ```
+   Copy the `https://<random>.trycloudflare.com` address it prints. **Leave
+   this terminal open for the whole demo.**
+3. Check it from the laptop: `https://<random>.trycloudflare.com/api/health`
+   should show `"status":"ok"`.
+4. **Each phone:** open that address in Chrome (Android) or Safari (iPhone),
+   wait for **"Ready to work offline"**, then reload once.
+5. **Laptop:** Edge on **http://localhost:4173** (no tunnel needed).
+6. Run scenes 1–8, with one change: go offline with **airplane mode** instead
+   of DevTools. Check that Wi-Fi is off too, since some phones keep it on in
+   airplane mode. Turning airplane mode off starts a sync by itself once the
+   phone has a connection again; if it does not, press **Sync now**.
+
+**Watch out**
+
+- **Every cloudflared restart gives a new address**, which is a new origin: an
+  empty database, signed out, and anything unsynced on the old address is
+  stranded on the phone. Do not restart the tunnel mid-demo. Between
+  rehearsals, restarting it is a quick way to give the phones fresh storage.
+- **While the tunnel runs, the API is on the public internet.** Anyone with the
+  address can reach the login with the demo passwords in this sheet (there is
+  no login rate limit). Press **Ctrl+C** in the cloudflared terminal as soon as
+  the demo ends.
 
 ---
 

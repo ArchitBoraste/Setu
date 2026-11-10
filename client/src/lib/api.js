@@ -1,4 +1,9 @@
 import { db, getAuthRow } from "../db/index.js";
+import {
+  REFRESH_DECISION,
+  REFRESH_LOCK_NAME,
+  decideTokenRefresh,
+} from "./tokenRefresh.js";
 
 // A dead uplink (wifi connected, internet not) often makes fetch() hang for
 // minutes instead of failing, so we give up ourselves after this long.
@@ -93,9 +98,16 @@ async function send(path, { method = "GET", body, accessToken } = {}) {
   return data;
 }
 
-async function requestNewTokens() {
-  const row = await getAuthRow();
-  if (!row?.sessionActive || !row.refreshToken) throw new NotAuthenticatedError();
+// Runs with the refresh lock held, where there is one (see withRefreshLock).
+// `startedWith` is the auth row the rejected request was sent with.
+async function requestNewTokens(startedWith) {
+  // Re-read now, not before the lock. The tab ahead of this one in the queue
+  // may have rotated the token this tab is holding.
+  const row = await db.authCache.get(startedWith.userId);
+
+  const decision = decideTokenRefresh(startedWith, row);
+  if (decision === REFRESH_DECISION.SIGNED_OUT) throw new NotAuthenticatedError();
+  if (decision === REFRESH_DECISION.ADOPT) return row.accessToken;
 
   let tokens;
   try {
@@ -128,13 +140,36 @@ async function requestNewTokens() {
   return tokens.accessToken;
 }
 
+// One refresh at a time across every tab of this app on the device. The server
+// takes a refresh token presented twice for a stolen one and revokes the whole
+// session, so two tabs refreshing with the same token would sign the user out
+// everywhere. Tabs queue here, and each re-reads authCache once it is its turn.
+//
+// The lock is held across the /refresh round trip and the authCache write, so
+// the next tab in line sees the new tokens. send()'s timeout bounds how long
+// that can take. A tab that closes mid-refresh releases the lock with it.
+//
+// Web Locks exist only in secure contexts: HTTPS, localhost and 127.0.0.1, so
+// the dev servers, the preview and the HTTPS tunnel all have them. A phone
+// opening the app over plain http on a LAN address does not. There the refresh
+// runs unlocked, as it always did, and the re-read in requestNewTokens still
+// catches a rotation another tab has already finished. Only two refreshes
+// truly at the same moment can collide.
+function withRefreshLock(task) {
+  const locks = typeof navigator === "undefined" ? undefined : navigator.locks;
+  if (!locks) return task();
+  return locks.request(REFRESH_LOCK_NAME, task);
+}
+
 let refreshInFlight = null;
 
-// Requests that hit a 401 at the same time share one refresh. The server rotates
-// refresh tokens, so a second parallel refresh would send a token the first one
-// had just revoked, get a 401, and end a perfectly good session.
-function refreshAccessToken() {
-  refreshInFlight ??= requestNewTokens().finally(() => {
+// Within one tab, requests that hit a 401 at the same time share one refresh
+// rather than queueing for the lock one behind another. The first caller's
+// auth row is the one the refresh starts from. Any later caller joining it was
+// sent with the same tokens, because nothing in this tab rotates them while a
+// refresh is in flight.
+function refreshAccessToken(startedWith) {
+  refreshInFlight ??= withRefreshLock(() => requestNewTokens(startedWith)).finally(() => {
     refreshInFlight = null;
   });
   return refreshInFlight;
@@ -160,7 +195,9 @@ export async function apiFetch(path, { method, body, auth = true } = {}) {
     // Retry exactly once. If a freshly issued access token is also refused, the
     // problem is not expiry (the account was disabled or the token revoked), and
     // refreshing again would get the same answer forever.
-    const accessToken = await refreshAccessToken();
+    // The row this request was sent with. If authCache holds anything else by
+    // the time the refresh lock is free, another tab got there first.
+    const accessToken = await refreshAccessToken(row);
     return send(path, { method, body, accessToken });
   }
 }

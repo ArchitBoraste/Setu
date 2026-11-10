@@ -2,6 +2,7 @@ import jwt from "jsonwebtoken";
 import { config } from "../config/env.js";
 import { pool } from "../db/index.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { createRequireLiveRole } from "../utils/liveRole.js";
 
 export function requireAuth(req, res, next) {
   const header = req.headers.authorization || "";
@@ -24,6 +25,7 @@ export function requireAuth(req, res, next) {
 }
 
 // Role comes from the verified token, never from anything the client claims.
+// For privileged online routes, follow it with requireLiveRole.
 export const requireRole =
   (...allowedRoles) =>
   (req, res, next) => {
@@ -32,6 +34,27 @@ export const requireRole =
     }
     next();
   };
+
+/**
+ * Re-checks the caller against the database on every request it guards: still
+ * active, still in this organisation, still one of these roles. See
+ * utils/liveRole.js for the decision and why 401 and 403 are split as they are.
+ *
+ *   router.use(requireAuth, requireRole("admin"), requireLiveRole("admin"))
+ *
+ * For the online-only surfaces (/api/admin, /api/conflicts), where a token's
+ * fifteen minutes of stale role is not acceptable. One indexed primary-key
+ * read per request.
+ */
+export const requireLiveRole = createRequireLiveRole(async ({ id, organizationId }) => {
+  const [[account]] = await pool.query(
+    `SELECT role, is_active AS isActive, (deleted_at IS NOT NULL) AS deleted
+       FROM users
+      WHERE id = ? AND organization_id = ?`,
+    [id, organizationId]
+  );
+  return account ?? null;
+});
 
 /**
  * Reads the caller's area from the database, on every request it guards.

@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
+import { BCRYPT_ROUNDS } from "../utils/passwords.js";
 
 // The demo organisation, its one area, and the four people in the demo.
 //
@@ -18,8 +19,6 @@ import bcrypt from "bcryptjs";
 
 const ORG_NAME = "Demo Health Organisation";
 const AREA_NAME = "Wadgaon";
-
-const BCRYPT_ROUNDS = 12;
 
 // A password is used only to CREATE an account. An account that already exists
 // keeps the password it has: a seed that quietly reset credentials every time

@@ -4,6 +4,7 @@ import { pool } from "./db/index.js";
 import authRoutes from "./routes/auth.js";
 import syncRoutes from "./routes/sync.js";
 import conflictRoutes from "./routes/conflicts.js";
+import adminRoutes from "./routes/admin.js";
 
 // Last-resort visibility. `node --watch` clears the terminal when it restarts
 // a crashed process, so without these a fatal error can scroll away before it
@@ -74,6 +75,9 @@ app.use("/api/sync", syncRoutes);
 // decision, not a device moving data, and unlike everything under /api/sync they
 // are online-only by design (see sync/conflictRules.js).
 app.use("/api/conflicts", conflictRoutes);
+// Users and areas. Admin-only and online-only, like /api/conflicts; the router
+// applies its own role check to every path under it (see routes/admin.js).
+app.use("/api/admin", adminRoutes);
 
 // 404 handler — anything not matched above
 app.use((req, res) => {

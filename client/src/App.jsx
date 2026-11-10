@@ -9,6 +9,7 @@ import UpdatePrompt from "./components/UpdatePrompt.jsx";
 import CaptureScreen from "./records/CaptureScreen.jsx";
 import RemoveAccountPanel from "./records/RemoveAccountPanel.jsx";
 import ConflictReviewScreen from "./conflicts/ConflictReviewScreen.jsx";
+import AdminScreen from "./admin/AdminScreen.jsx";
 import { DATABASE_OUTDATED_EVENT } from "./db/index.js";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
@@ -68,7 +69,12 @@ function LoginForm({ onSubmit, busy }) {
           // A digits-only keypad on phones. Stored numbers carry no "+",
           // so nothing a worker needs is missing from it.
           inputMode="numeric"
-          autoComplete="tel"
+          // "username", not "tel". The phone number is this app's sign-in
+          // name, and "tel" asks the browser for the DEVICE OWNER's number:
+          // on a shared phone it offers one person's number to everyone who
+          // signs in, and a tap signs the next worker in as someone else.
+          // "username" pairs with the password field for password managers.
+          autoComplete="username"
           value={phone}
           onChange={(e) => setPhone(e.target.value)}
         />
@@ -96,7 +102,11 @@ function LoginForm({ onSubmit, busy }) {
 // component anyway would see an empty list and be refused on every action.
 const CAN_REVIEW_CONFLICTS = new Set(["supervisor", "admin"]);
 
-function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
+// The same rule for the admin section: drawn for the role cached at sign-in,
+// enforced by /api/admin against the token and the database on every request.
+const CAN_ADMINISTER = new Set(["admin"]);
+
+function SignedIn({ user, mode, online, onSignOut, onRemove, busy }) {
   return (
     <div>
       <p>
@@ -116,6 +126,10 @@ function SignedIn({ user, mode, onSignOut, onRemove, busy }) {
       <CaptureScreen />
 
       {CAN_REVIEW_CONFLICTS.has(user.role) && <ConflictReviewScreen />}
+
+      {CAN_ADMINISTER.has(user.role) && (
+        <AdminScreen currentUserId={user.userId} online={online} />
+      )}
 
       <RemoveAccountPanel onRemove={onRemove} busy={busy} />
     </div>
@@ -219,6 +233,7 @@ export default function App() {
         <SignedIn
           user={session.user}
           mode={session.mode}
+          online={online}
           onSignOut={handleSignOut}
           onRemove={handleRemove}
           busy={busy}

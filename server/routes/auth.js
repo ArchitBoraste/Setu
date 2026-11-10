@@ -16,10 +16,9 @@ import {
   rotateRefreshToken,
   revokeRefreshFamily,
 } from "../utils/tokens.js";
+import { BCRYPT_ROUNDS } from "../utils/passwords.js";
 
 const router = express.Router();
-
-const BCRYPT_ROUNDS = 12;
 
 // What a sign-in for a phone with no account compares the password against,
 // so that it costs one bcrypt.compare like a wrong password does. Skipping the
@@ -29,9 +28,9 @@ const BCRYPT_ROUNDS = 12;
 //
 // A real hash of a random password nobody knows, made once at startup at the
 // same cost as real accounts: bcrypt's running time is set by the cost stored
-// in the hash. db/demoData.js hashes the seeded accounts at 12 too. If the two
-// costs ever drift apart, unknown numbers and real ones become distinguishable
-// again.
+// in the hash. Every place that sets a password (the admin routes, the demo
+// seed) imports the same BCRYPT_ROUNDS, so a change to it moves them together.
+// Hashes already stored keep their old cost, though — see utils/passwords.js.
 const DUMMY_PASSWORD_HASH = await bcrypt.hash(
   crypto.randomBytes(32).toString("hex"),
   BCRYPT_ROUNDS

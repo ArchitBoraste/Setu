@@ -1,6 +1,6 @@
 import express from "express";
 import { pool } from "../db/index.js";
-import { requireAuth, requireRole } from "../middleware/auth.js";
+import { requireAuth, requireLiveRole, requireRole } from "../middleware/auth.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { RESOLVED_DEVICE_ID } from "../sync/pushRules.js";
 import {
@@ -19,7 +19,15 @@ const router = express.Router();
 // decides what to RENDER and the server decides what is ALLOWED. A field
 // worker's bundle simply does not draw the screen; that is a UI choice, and it
 // is not what keeps them out.
-const requireSupervisor = [requireAuth, requireRole("supervisor", "admin")];
+//
+// requireLiveRole then asks the database too. A resolution rewrites somebody's
+// household record, and a supervisor deactivated or demoted a minute ago must
+// not keep doing that for the rest of their token's fifteen minutes.
+const requireSupervisor = [
+  requireAuth,
+  requireRole("supervisor", "admin"),
+  requireLiveRole("supervisor", "admin"),
+];
 
 const DEFAULT_CONFLICT_LIMIT = 50;
 const MAX_CONFLICT_LIMIT = 200;

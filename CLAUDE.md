@@ -16,6 +16,8 @@ The React UI never talks to the network directly. It reads and writes IndexedDB 
 
 No code in `client/src` may assume the internet exists. If a feature breaks when the network drops, it is wrong.
 
+Two surfaces are the deliberate exception, online-only by design and saying so on screen: conflict resolution (`client/src/conflicts`, `/api/conflicts`) and admin (`client/src/admin`, `/api/admin`). Both are privileged decisions that two offline devices would make in an order nobody chose. Neither is on the path a field worker uses to capture or sync, and neither may become one.
+
 ## Who sees which records: area-based sharing
 
 - **Field workers share records within their area** (a village or ward). A field worker pulls, sees, edits and deletes every record in their own area, plus any record with **no** area that they captured themselves.
@@ -46,7 +48,7 @@ No code in `client/src` may assume the internet exists. If a feature breaks when
 - **A row holding another user's unsent change cannot be edited on that phone** until that user syncs; editing on top would send their work under your name.
 - **Sync order is push, then pull.** Pulling first returns stale versions of rows the device is about to overwrite.
 - **`authCache` holds exactly one row** — the person signed in on this device. Never cache another user's hash or tokens.
-- The client decides what to *render*; the server decides what is *allowed*. Always re-check roles from the verified JWT, never from anything the client sends.
+- The client decides what to *render*; the server decides what is *allowed*. Always re-check roles from the verified JWT, never from anything the client sends. Privileged online routes (`/api/conflicts`, `/api/admin`) also re-check active and role in the database with `requireLiveRole`.
 
 ## Known gaps (do not "fix" silently — raise them first)
 
@@ -55,11 +57,13 @@ Auth
 - Anyone who knows a worker's phone number can lock it out of online sign-in for 15 minutes with five wrong passwords, and do it again as soon as it lifts. The device does not fall back to offline sign-in on a 429, only when the server is unreachable.
 - The global cap (100 failed logins a minute, across all numbers) refuses every online sign-in while it is engaged, correct passwords included. Anyone who can reach the API can trigger it, and it lifts within a minute of the flood stopping.
 - Login accepts only ASCII digits (optional leading `+`) and answers anything else with 400. `users.phone` uses `utf8mb4_0900_ai_ci`, which matches Devanagari or fullwidth digits to the ASCII number, so allowing them would give one account endless spellings, each with its own rate-limit count. A keyboard typing Marathi digits used to sign in online by that accident and now cannot. Phones must be stored as ASCII digits.
-- The dummy hash compared for unknown phone numbers is made at `BCRYPT_ROUNDS` in `routes/auth.js`. If the cost stored accounts are hashed at (`db/demoData.js`) ever differs, unknown and registered numbers become distinguishable by timing again.
+- The dummy hash compared for unknown phone numbers and every stored password hash share one `BCRYPT_ROUNDS` (`server/utils/passwords.js`). Changing it does not rehash stored accounts, so until each password is next set, unknown and registered numbers are distinguishable by timing.
+- Deactivating a user or resetting their password revokes all their refresh tokens. A deactivated user is refused at once by sync (`loadArea`) and by `/api/conflicts` and `/api/admin` (`requireLiveRole`), which re-read the account on every request. A password reset does not end an access token already issued: it works for up to 15 minutes, then its refresh fails. A phone they already signed in on still opens offline with the old password for up to 7 days, though nothing captured there will sync.
 - On a shared phone, a second worker cannot sync the first worker's unsent changes and can wipe them via Remove account; the screen warns but cannot prevent it. Those rows are also locked against the second worker's edits until the first worker syncs.
-- Role is read from the JWT, so a supervisor demoted to field worker keeps organisation scope until their access token expires (up to 15 minutes). Area, by contrast, is read from the database on every request.
+- Sync reads role from the JWT, so a supervisor demoted to field worker keeps organisation scope for sync until their access token expires (up to 15 minutes). Area, by contrast, is read from the database on every request, and `/api/conflicts` and `/api/admin` check role in the database too.
 
 Areas
+- Moving a household or reassigning a worker between areas has no automatic device cleanup; see docs/design/household-move.md.
 - Reassigning a worker does not remove the old area's records from their phone. The list hides them, but IndexedDB keeps them, so a lost phone still exposes the old area until the account is removed.
 - A worker moved to another area has pending edits to old-area records refused as `forbidden` (and hidden from their list), and never receives resolutions for conflicts they raised there; such a row stays locked, hidden, on their phone. Captures made before the move but pushed after it are filed under the NEW area.
 - There is no way to move a household between areas. Changing `records.area_id` by hand does not move `updated_at`, so devices in the new area never receive the record and devices in the old one keep their copy.

@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
 import { BCRYPT_ROUNDS } from "../utils/passwords.js";
+import { HOUSEHOLD_SURVEY_V1 } from "../forms/householdSurveyV1.js";
 
 // The demo organisation, its one area, and the four people in the demo.
 //
@@ -184,6 +185,36 @@ async function ensureUser(conn, spec, organizationId, areaId, log) {
 }
 
 /**
+ * Ensures the organisation has household_survey version 1, published.
+ *
+ * Inserted only when missing, never compared or rewritten: a published version
+ * is immutable, and the capture screen falls back to this exact definition on a
+ * phone that has not downloaded any forms yet. A database migrated by 006
+ * already has it, so on those this does nothing.
+ *
+ * demo:reset does not delete form definitions, so later versions an admin
+ * published survive a reset; this only guarantees version 1 is there.
+ */
+async function ensureHouseholdSurveyV1(conn, organizationId, log) {
+  const { formType, version, title, fields } = HOUSEHOLD_SURVEY_V1;
+  const [[existing]] = await conn.query(
+    `SELECT id FROM form_definitions
+      WHERE organization_id = ? AND form_type = ? AND version = ?`,
+    [organizationId, formType, version]
+  );
+  if (existing) return;
+
+  await conn.query(
+    `INSERT INTO form_definitions
+       (id, organization_id, form_type, version, title, fields, status, created_by,
+        published_at)
+     VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), 'published', NULL, NOW(3))`,
+    [crypto.randomUUID(), organizationId, formType, version, title, JSON.stringify(fields)]
+  );
+  log(`Published ${formType} version ${version}.`);
+}
+
+/**
  * Ensures the demo organisation, area and users exist, on the connection
  * given. The caller owns the transaction, so a reset can wipe and re-seed as
  * one unit: if the seed fails, the wipe is rolled back with it.
@@ -207,6 +238,8 @@ export async function seedDemoData(conn) {
     }
     await ensureUser(conn, spec, organizationId, areaId, log);
   }
+
+  await ensureHouseholdSurveyV1(conn, organizationId, log);
 
   if (lines.length === 0) lines.push("Demo data already in place. Nothing changed.");
   return lines;

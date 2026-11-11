@@ -174,6 +174,20 @@ db.version(7)
       })
   );
 
+// Version 8 adds the forms a device captures with: every published form
+// definition of the signed-in user's organisation, as GET /api/forms last sent
+// it. Downloaded at sign-in and at the start of every sync, read offline.
+//
+// [organizationId+formType+version] is the only lookup there is: "this
+// record's version" and "the latest version of this form" for one
+// organisation. Rows are tagged with the organisation because a phone can be
+// handed to someone from another one, and their forms must not be offered.
+// Not synced in the records sense: published definitions never change, so a
+// refresh simply replaces the organisation's rows.
+db.version(8).stores({
+  forms: "id, [organizationId+formType+version]",
+});
+
 // Fired when another tab running newer code wants to upgrade the schema. Until
 // this tab closes the database, that upgrade is blocked and the new tab hangs on
 // an unopened database. Closing here unblocks it; this tab's own queries then

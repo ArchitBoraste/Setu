@@ -30,8 +30,10 @@ export { SYNC_STATE };
  *            correctly as text, and carry no timezone to be misread.
  *   text     trimmed strings, empty answer as null.
  *   choices  the option value as a string.
+ *   yes/no   true or false; unanswered is null, never a default false.
  *
- * Coercion happens at capture, where the form knows which field is which. Once
+ * Coercion happens at capture (toPayload in forms/formRules.js), where the
+ * record's form definition says which field is which. Once
  * a row is stored, its types are what the server will validate against, and
  * changing the rule later means rewriting rows on every device.
  */

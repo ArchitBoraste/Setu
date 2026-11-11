@@ -18,65 +18,60 @@ import {
 import { getCachedUser } from "../auth/authService.js";
 import { shortTime } from "../lib/time.js";
 import CompareGrid from "../components/CompareGrid.jsx";
+import FormFields from "../forms/FormFields.jsx";
+import { FORMS_UPDATED_EVENT, loadCatalog } from "../forms/formStore.js";
+import {
+  checkAnswers,
+  chooseDefinition,
+  emptyValues,
+  findDefinition,
+  isPristine,
+  summarise,
+  toFormValues,
+  toPayload,
+} from "../forms/formRules.js";
 import { EDIT_BLOCK, editBlockReason, seesWholeOrganisation } from "./scope.js";
 
-// Temporary capture screen. The form is hardcoded so there is real data to sync
-// in the next step; the dynamic form builder replaces it later.
+// Temporary capture screen, drawn from the published form definitions this
+// device holds (see forms/formRules.js for which one is used when):
+//
+//   a NEW record    uses the latest version of the form;
+//   an EDIT         uses the record's own version, so an old record keeps the
+//                   fields it was captured with and stays valid.
+//
+// Everything here reads IndexedDB. Forms arrive with sign-in and sync; with
+// none downloaded yet, the built-in version 1 is used, so a first start
+// offline can still capture.
 
-export const FORM_TYPE = "household_survey";
-
-// Bump when a field is added, removed or changes meaning, so rows captured by
-// an older revision stay interpretable.
-export const FORM_VERSION = 1;
-
-const NUMBER_FIELDS = ["memberCount", "childrenUnderFive"];
-
-// See the payload value rule in recordService.js. Inputs hand back strings for
-// everything, so the coercion lives here, where the form knows which field is a
-// count and which is free text. An unanswered field is null, never "" or 0.
-function toPayload(form) {
-  const payload = {};
-
-  for (const [field, raw] of Object.entries(form)) {
-    const value = typeof raw === "string" ? raw.trim() : raw;
-
-    if (value === "" || value === null || value === undefined) {
-      payload[field] = null;
-    } else if (NUMBER_FIELDS.includes(field)) {
-      const asNumber = Number(value);
-      payload[field] = Number.isFinite(asNumber) ? asNumber : null;
-    } else {
-      // Dates already arrive as ISO 8601 ("2026-09-22") from <input type="date">.
-      payload[field] = value;
-    }
-  }
-
-  return payload;
+/**
+ * The form on screen: which definition it is drawn from, what has been typed,
+ * and which record it edits (null for a new one). One object, so a single
+ * state update decides all three together — see adoptLatestForm.
+ */
+function freshForm(catalog) {
+  const choice = chooseDefinition({ catalog });
+  const definition = choice.definition ?? null;
+  return {
+    definition,
+    values: definition ? emptyValues(definition) : {},
+    editingId: null,
+    builtin: Boolean(choice.builtin),
+  };
 }
 
-// React warns about a null value on a controlled input, so nulls become "" on
-// the way back into the form.
-function toFormState(payload) {
-  const form = { ...EMPTY_FORM };
-  for (const [field, value] of Object.entries(payload ?? {})) {
-    form[field] = value === null || value === undefined ? "" : String(value);
-  }
-  return form;
+/**
+ * The form to show after the catalog changed. A newly downloaded version
+ * replaces the one on screen only while nothing has been typed into it and no
+ * record is being edited: swapping fields under a worker mid-capture would
+ * move or drop what they entered.
+ */
+function adoptLatestForm(current, catalog) {
+  if (current.definition && (current.editingId || !isPristine(current.values))) return current;
+  return freshForm(catalog);
 }
 
-const WATER_SOURCES = ["Piped", "Handpump", "Well", "Tanker", "Other"];
-
-const EMPTY_FORM = {
-  householdName: "",
-  memberCount: "",
-  visitDate: "",
-  waterSource: "",
-  childrenUnderFive: "",
-  notes: "",
-};
-
-// Field labels live in ./formFields.js and the side-by-side diff in
-// ../components/CompareGrid.jsx, both shared with the supervisor's screen.
+// The side-by-side diff lives in ../components/CompareGrid.jsx, shared with
+// the supervisor's screen; labels come from each record's own definition.
 
 const BADGE_COLOURS = {
   [SYNC_STATE.SYNCED]: "seagreen",
@@ -87,8 +82,6 @@ const BADGE_COLOURS = {
 
 const styles = {
   section: { marginTop: "2rem", borderTop: "1px solid #ddd", paddingTop: "1rem" },
-  label: { display: "block", marginBottom: "0.75rem" },
-  field: { display: "block", width: "100%", padding: "0.4rem", marginTop: 2 },
   row: { borderBottom: "1px solid #eee", padding: "0.5rem 0" },
   badge: (state) => ({
     display: "inline-block",
@@ -137,77 +130,44 @@ async function loadRecords() {
     countUnsyncedOnDevice(),
     getCachedUser(),
   ]);
-  return { rows, pendingCount, lastSyncAt, deviceCounts, user };
+  // Read with everything else, so the rows are always drawn with the forms
+  // that were on the device when they were read.
+  const catalog = await loadCatalog(user?.organizationId);
+  return { rows, pendingCount, lastSyncAt, deviceCounts, user, catalog };
 }
 
-function summarise(record) {
-  const { householdName, visitDate, memberCount } = record.payload;
-  // "?" not 0: an unanswered count is not a count of zero.
-  return [householdName || "(no name)", visitDate, `${memberCount ?? "?"} members`]
-    .filter(Boolean)
-    .join(" · ");
-}
-
-function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
-  const set = (field) => (event) =>
-    onChange({ ...value, [field]: event.target.value });
-
+/**
+ * The form itself. noValidate, because checkAnswers is the check: it applies
+ * the server's rules and puts the message under the field, in the same words
+ * whichever browser the worker has.
+ */
+function SurveyForm({ form, problems, onChange, onSubmit, onCancel, busy }) {
+  const { definition, editingId } = form;
   return (
-    <form onSubmit={onSubmit}>
-      <label style={styles.label}>
-        Household name
-        <input style={styles.field} value={value.householdName} onChange={set("householdName")} />
-      </label>
-      <label style={styles.label}>
-        Members in household
-        <input
-          style={styles.field}
-          type="number"
-          min="0"
-          value={value.memberCount}
-          onChange={set("memberCount")}
-        />
-      </label>
-      <label style={styles.label}>
-        Children under five
-        <input
-          style={styles.field}
-          type="number"
-          min="0"
-          value={value.childrenUnderFive}
-          onChange={set("childrenUnderFive")}
-        />
-      </label>
-      <label style={styles.label}>
-        Visit date
-        <input style={styles.field} type="date" value={value.visitDate} onChange={set("visitDate")} />
-      </label>
-      <label style={styles.label}>
-        Main water source
-        <select style={styles.field} value={value.waterSource} onChange={set("waterSource")}>
-          <option value="">Select…</option>
-          {WATER_SOURCES.map((source) => (
-            <option key={source} value={source}>
-              {source}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label style={styles.label}>
-        Notes
-        <textarea style={styles.field} rows={3} value={value.notes} onChange={set("notes")} />
-      </label>
+    <form onSubmit={onSubmit} noValidate>
+      <FormFields
+        definition={definition}
+        values={form.values}
+        problems={problems}
+        onChange={onChange}
+        disabled={busy}
+      />
 
       <button type="submit" disabled={busy}>
-        {editing ? "Save changes" : "Save record"}
+        {editingId ? "Save changes" : "Save record"}
       </button>{" "}
-      {editing && (
+      {editingId && (
         <button type="button" onClick={onCancel} disabled={busy}>
           Cancel
         </button>
       )}
     </form>
   );
+}
+
+/** The record's own form version, or null when this device does not have it. */
+function definitionOf(record, catalog) {
+  return findDefinition(catalog, record.formType, record.formVersion);
 }
 
 /**
@@ -218,7 +178,7 @@ function SurveyForm({ value, onChange, onSubmit, onCancel, busy, editing }) {
  * a red badge with nothing behind it — "conflict" means nothing to somebody who
  * cannot see what the two sides actually disagree about.
  */
-function ConflictCompare({ record }) {
+function ConflictCompare({ record, catalog }) {
   const server = record.serverConflict;
   if (!server) return null;
 
@@ -233,6 +193,10 @@ function ConflictCompare({ record }) {
       rightLabel={`On the server (v${server.version}${serverBy})`}
       left={record.payload}
       right={server.payload}
+      definitions={[
+        definitionOf(record, catalog),
+        findDefinition(catalog, server.formType, server.formVersion),
+      ]}
       extraRows={[
         ["Deleted", record.deletedAt ? "yes" : "no", server.deletedAt ? "yes" : "no"],
         ["Server saved", "—", shortTime(server.updatedAt) ?? "—"],
@@ -299,9 +263,15 @@ function resolutionHeadline({ resolution, submittedByMe, submittedDeleted, resto
  * is barely different from no notice at all. It stays until the worker dismisses
  * it, and dismissing says what is being given up.
  */
-function ResolutionNotice({ record, onDismiss, busy }) {
+function ResolutionNotice({ record, catalog, onDismiss, busy }) {
   const notice = record.resolvedNotice;
   if (!notice) return null;
+
+  // Each kept copy is labelled by the form version it was captured under, when
+  // the notice recorded it; older notices fall back to the record's own.
+  const current = definitionOf(record, catalog);
+  const versionOf = (formVersion) =>
+    formVersion == null ? current : findDefinition(catalog, record.formType, formVersion);
 
   const discarded = notice.discardedPayload;
   // Absent on notices written before this field existed, which is why it is
@@ -356,6 +326,7 @@ function ResolutionNotice({ record, onDismiss, busy }) {
             rightLabel={`Now (v${record.version})`}
             left={superseded}
             right={record.payload}
+            definitions={[versionOf(notice.supersededFormVersion), current]}
           />
         </>
       )}
@@ -375,6 +346,7 @@ function ResolutionNotice({ record, onDismiss, busy }) {
             rightLabel={`Now (v${record.version})`}
             left={discarded}
             right={record.payload}
+            definitions={[versionOf(notice.discardedFormVersion), current]}
           />
         </>
       ) : (
@@ -420,7 +392,17 @@ function Attribution({ record }) {
   );
 }
 
-function RecordRow({ record, user, onEdit, onDelete, onDismiss, busy, expanded, onToggle }) {
+function RecordRow({
+  record,
+  user,
+  catalog,
+  onEdit,
+  onDelete,
+  onDismiss,
+  busy,
+  expanded,
+  onToggle,
+}) {
   const isConflict = record.syncState === SYNC_STATE.CONFLICT;
   const isRejected = record.syncState === SYNC_STATE.REJECTED;
   const isPending = record.syncState === SYNC_STATE.PENDING;
@@ -433,12 +415,18 @@ function RecordRow({ record, user, onEdit, onDelete, onDismiss, busy, expanded, 
   const heldForOtherEditor =
     user != null && editBlockReason(record, user) === EDIT_BLOCK.OTHER_EDITOR;
   const locked = isConflict || heldForOtherEditor;
+  const definition = definitionOf(record, catalog);
 
   return (
     <li style={styles.row}>
       <span style={styles.badge(record.syncState)}>{record.syncState}</span>{" "}
-      {summarise(record)}{" "}
-      <span style={styles.muted}>v{record.version}</span>
+      {summarise(record.payload, definition)}{" "}
+      <span style={styles.muted}>
+        v{record.version} · form v{record.formVersion}
+        {/* Said, not hidden: the row can still be read by its keys, but it
+            cannot be edited until the version arrives (see handleEdit). */}
+        {!definition && " (not on this phone yet — sync to download it)"}
+      </span>
       {record.deletedAt && <span style={styles.muted}> · deleted</span>}
       <br />
       <Attribution record={record} />
@@ -472,7 +460,7 @@ function RecordRow({ record, user, onEdit, onDelete, onDismiss, busy, expanded, 
         </p>
       )}
 
-      {isConflict && expanded && <ConflictCompare record={record} />}
+      {isConflict && expanded && <ConflictCompare record={record} catalog={catalog} />}
 
       {(isPending || isRejected) && serverDeleted && (
         <p style={styles.muted}>
@@ -488,7 +476,7 @@ function RecordRow({ record, user, onEdit, onDelete, onDismiss, busy, expanded, 
         </p>
       )}
 
-      <ResolutionNotice record={record} onDismiss={onDismiss} busy={busy} />
+      <ResolutionNotice record={record} catalog={catalog} onDismiss={onDismiss} busy={busy} />
 
       {isRejected && (
         <p style={styles.muted}>
@@ -660,9 +648,28 @@ function SyncNotice({ summary }) {
   return <p style={styles.notice()}>{parts.join(" · ")}</p>;
 }
 
+/** What the form heading says about the version on screen. */
+function formCaption(form) {
+  const { definition, editingId, builtin } = form;
+  if (editingId) {
+    // The record's own version, which may be older than the one new records
+    // use. Said, so a worker missing a newer question knows why.
+    return `Editing a record captured on form version ${definition.version}, with that version's questions.`;
+  }
+  return builtin
+    ? `Form version ${definition.version}, built into the app. Sync while online to get the latest version.`
+    : `Form version ${definition.version}.`;
+}
+
 export default function CaptureScreen() {
-  const [form, setForm] = useState(EMPTY_FORM);
-  const [editingId, setEditingId] = useState(null);
+  const [catalog, setCatalog] = useState([]);
+  // { definition, values, editingId, builtin } — see freshForm. definition is
+  // null only until the first read of the catalog.
+  const [form, setForm] = useState({ definition: null, values: {}, editingId: null, builtin: false });
+  // Per-field problems from the last save attempt, by key.
+  const [problems, setProblems] = useState({});
+  // Why an edit could not be opened, said where the form is.
+  const [formNotice, setFormNotice] = useState(null);
   const [records, setRecords] = useState([]);
   const [pending, setPending] = useState(0);
   const [lastSyncAt, setLastSyncAt] = useState(null);
@@ -674,26 +681,23 @@ export default function CaptureScreen() {
   const [syncSummary, setSyncSummary] = useState(null);
   const [expandedId, setExpandedId] = useState(null);
 
-  const refresh = useCallback(async () => {
-    const { rows, pendingCount, lastSyncAt: at, deviceCounts: counts, user: current } =
-      await loadRecords();
-    setRecords(rows);
-    setPending(pendingCount);
-    setLastSyncAt(at);
-    setDeviceCounts(counts);
-    setUser(current);
+  const apply = useCallback((loaded) => {
+    setRecords(loaded.rows);
+    setPending(loaded.pendingCount);
+    setLastSyncAt(loaded.lastSyncAt);
+    setDeviceCounts(loaded.deviceCounts);
+    setUser(loaded.user);
+    setCatalog(loaded.catalog);
+    setForm((current) => adoptLatestForm(current, loaded.catalog));
   }, []);
+
+  const refresh = useCallback(async () => apply(await loadRecords()), [apply]);
 
   useEffect(() => {
     let cancelled = false;
     loadRecords()
-      .then(({ rows, pendingCount, lastSyncAt: at, deviceCounts: counts, user: current }) => {
-        if (cancelled) return;
-        setRecords(rows);
-        setPending(pendingCount);
-        setLastSyncAt(at);
-        setDeviceCounts(counts);
-        setUser(current);
+      .then((loaded) => {
+        if (!cancelled) apply(loaded);
       })
       .catch((err) => {
         if (!cancelled) setError(`Could not read local records: ${err.message}`);
@@ -701,11 +705,12 @@ export default function CaptureScreen() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [apply]);
 
   // A sync can also start without anyone pressing anything — the "online" event
   // fires wherever the worker happens to be in the app — so the list listens for
-  // the result rather than only updating after its own button.
+  // the result rather than only updating after its own button. Forms arrive the
+  // same way, at sign-in and at the start of each sync.
   useEffect(() => {
     const stopReconnectSync = startSyncOnReconnect();
 
@@ -713,11 +718,14 @@ export default function CaptureScreen() {
       setSyncSummary(event.detail);
       void refresh().catch(() => {});
     };
+    const onForms = () => void refresh().catch(() => {});
     window.addEventListener(SYNC_EVENT, onSynced);
+    window.addEventListener(FORMS_UPDATED_EVENT, onForms);
 
     return () => {
       stopReconnectSync();
       window.removeEventListener(SYNC_EVENT, onSynced);
+      window.removeEventListener(FORMS_UPDATED_EVENT, onForms);
     };
   }, [refresh]);
 
@@ -763,42 +771,80 @@ export default function CaptureScreen() {
     }
   };
 
+  const resetForm = () => {
+    setForm(freshForm(catalog));
+    setProblems({});
+  };
+
+  const handleChange = (values) => {
+    // A field the worker has just changed no longer shows the problem it had;
+    // the rest stay until the next save attempt re-checks them.
+    setProblems((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([key]) => values[key] === form.values[key])
+      )
+    );
+    setForm((current) => ({ ...current, values }));
+  };
+
   const handleSubmit = (event) => {
     event.preventDefault();
-    return run(async () => {
-      const payload = toPayload(form);
+    const { definition, editingId, values } = form;
+    if (!definition) return;
 
+    // Checked here, on the phone, so a mistake is fixed at the household rather
+    // than refused by the server at the next sync. The server checks again.
+    const payload = toPayload(definition, values);
+    const found = checkAnswers(definition, payload);
+    setProblems(found);
+    if (Object.keys(found).length > 0) return;
+
+    return run(async () => {
       if (editingId) {
+        // The record keeps its form version: updateRecord changes the payload
+        // only, and the payload was built from that same version's fields.
         await updateRecord(editingId, payload);
-        setEditingId(null);
       } else {
         await createRecord({
-          formType: FORM_TYPE,
-          formVersion: FORM_VERSION,
+          formType: definition.formType,
+          formVersion: definition.version,
           payload,
         });
       }
-      setForm(EMPTY_FORM);
+      resetForm();
     });
   };
 
   const handleEdit = (record) => {
-    setEditingId(record.id);
-    setForm(toFormState(record.payload));
+    const choice = chooseDefinition({ catalog, record });
+    if (choice.missing) {
+      // Said rather than guessed at: opening a version-3 record with another
+      // version's fields would drop or mislabel what the worker recorded.
+      setFormNotice(
+        `This record was captured with form version ${choice.missing.version}, which is not ` +
+          "on this phone yet. Sync while online to download it, then edit the record."
+      );
+      return;
+    }
+    setFormNotice(null);
+    setProblems({});
+    setForm({
+      definition: choice.definition,
+      values: toFormValues(choice.definition, record.payload),
+      editingId: record.id,
+      builtin: choice.builtin,
+    });
   };
 
   const handleDelete = (record) =>
     run(async () => {
       await softDeleteRecord(record.id);
-      if (editingId === record.id) {
-        setEditingId(null);
-        setForm(EMPTY_FORM);
-      }
+      if (form.editingId === record.id) resetForm();
     });
 
   const handleCancel = () => {
-    setEditingId(null);
-    setForm(EMPTY_FORM);
+    setFormNotice(null);
+    resetForm();
   };
 
   // Confirmed, because on a kept_server resolution this is the last copy of the
@@ -825,7 +871,7 @@ export default function CaptureScreen() {
 
   return (
     <div style={styles.section}>
-      <h2>Household survey</h2>
+      <h2>{form.definition?.title ?? "Household survey"}</h2>
 
       <div style={styles.syncBar}>
         <button onClick={handleSync} disabled={syncing}>
@@ -840,15 +886,23 @@ export default function CaptureScreen() {
       <OtherWorkerNotice deviceCounts={deviceCounts} />
 
       {error && <p style={styles.error}>{error}</p>}
+      {formNotice && <p style={styles.notice("warn")}>{formNotice}</p>}
 
-      <SurveyForm
-        value={form}
-        onChange={setForm}
-        onSubmit={handleSubmit}
-        onCancel={handleCancel}
-        busy={busy}
-        editing={Boolean(editingId)}
-      />
+      {form.definition ? (
+        <>
+          <p style={styles.muted}>{formCaption(form)}</p>
+          <SurveyForm
+            form={form}
+            problems={problems}
+            onChange={handleChange}
+            onSubmit={handleSubmit}
+            onCancel={handleCancel}
+            busy={busy}
+          />
+        </>
+      ) : (
+        <p style={styles.muted}>Loading the form…</p>
+      )}
 
       <h3>{listHeading(user, records.length)}</h3>
       {records.length === 0 ? (
@@ -860,6 +914,7 @@ export default function CaptureScreen() {
               key={record.id}
               record={record}
               user={user}
+              catalog={catalog}
               onEdit={handleEdit}
               onDelete={handleDelete}
               onDismiss={handleDismissNotice}

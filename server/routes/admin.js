@@ -6,6 +6,7 @@ import { requireAuth, requireLiveRole, requireRole } from "../middleware/auth.js
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { BCRYPT_ROUNDS } from "../utils/passwords.js";
 import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
+import adminFormsRoutes from "./adminForms.js";
 import {
   ADMIN_ERROR,
   isUuid,
@@ -40,6 +41,10 @@ const router = express.Router();
 // requireRole first, so a field worker is refused from the token alone without
 // costing a query, and the database check only runs for tokens that claim admin.
 router.use(requireAuth, requireRole("admin"), requireLiveRole("admin"));
+
+// Form versions. Mounted after the line above, so every forms route is behind
+// the same live admin check; see routes/adminForms.js.
+router.use("/forms", adminFormsRoutes);
 
 // A failed rule, as the client shows it. INVALID is a bad request; the other
 // two are refusals of a well-formed request because of who is asking or what

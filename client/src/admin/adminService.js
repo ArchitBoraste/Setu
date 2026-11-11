@@ -58,3 +58,30 @@ export function createArea(name) {
 export function renameArea(areaId, name) {
   return apiFetch(`${ADMIN_PATH}/areas/${areaId}`, { method: "PATCH", body: { name } });
 }
+
+// Form versions. Online-only like everything above: two admins publishing from
+// two offline phones would each mint the same version number.
+
+export function listFormDefinitions() {
+  return apiFetch(`${ADMIN_PATH}/forms`);
+}
+
+/** A draft of the next version, copied from the latest published one. */
+export function createFormDraft(formType) {
+  return apiFetch(`${ADMIN_PATH}/forms/${encodeURIComponent(formType)}/drafts`, {
+    method: "POST",
+  });
+}
+
+/** @param {{ title, fields }} definition */
+export function saveFormDraft(draftId, definition) {
+  return apiFetch(`${ADMIN_PATH}/forms/drafts/${draftId}`, { method: "PUT", body: definition });
+}
+
+export function deleteFormDraft(draftId) {
+  return apiFetch(`${ADMIN_PATH}/forms/drafts/${draftId}`, { method: "DELETE" });
+}
+
+export function publishFormDraft(draftId) {
+  return apiFetch(`${ADMIN_PATH}/forms/drafts/${draftId}/publish`, { method: "POST" });
+}

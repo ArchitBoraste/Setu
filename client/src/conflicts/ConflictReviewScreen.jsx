@@ -1,14 +1,21 @@
 import { Fragment, useCallback, useEffect, useState } from "react";
 import { NetworkError, NotAuthenticatedError } from "../lib/api.js";
-import { differingFields, unionFields } from "../lib/payload.js";
+import { differingFields } from "../lib/payload.js";
 import { shortTime } from "../lib/time.js";
-import { FIELD_LABELS, showValue } from "../records/formFields.js";
+import { describeFields, findDefinition, formatValue, summarise } from "../forms/formRules.js";
+import { useFormCatalog } from "../forms/useFormCatalog.js";
+import { refreshForms } from "../sync/formSync.js";
 import CompareGrid from "../components/CompareGrid.jsx";
 import { listConflicts, resolveConflict } from "./conflictService.js";
 
-// Temporary review screen, matching the rest of the app: hardcoded form,
-// minimal inline styling, enough to prove the decision path works end to end. A
-// teammate builds the real UI later.
+// Temporary review screen, matching the rest of the app: minimal inline
+// styling, enough to prove the decision path works end to end. A teammate
+// builds the real UI later.
+//
+// Labels and values come from the form definitions the device holds, each
+// copy read with the version it was captured under. This screen is online, so
+// it asks for the latest forms whenever it loads; a version still missing is
+// shown by its field keys rather than not at all.
 //
 // Rendered only for supervisors and admins — but that is a choice about what to
 // DRAW. What keeps a field worker out is requireRole on every route this calls,
@@ -91,9 +98,22 @@ function deviceLabel(side) {
  * marking a supervisor is diffing twenty identical rows by eye, which is how a
  * wrong version gets kept.
  */
-function VersionCompare({ conflict }) {
+/** The definitions of a conflict's three copies, null where not on this device. */
+function definitionsOf(conflict, catalog) {
+  const of = (side) => (side ? findDefinition(catalog, side.formType, side.formVersion) : null);
+  return {
+    current: of(conflict.current),
+    submitted: of(conflict.submitted),
+    superseded: of(conflict.superseded),
+  };
+}
+
+function VersionCompare({ conflict, definitions }) {
   const { current, submitted } = conflict;
-  const fields = unionFields(current.payload, submitted.payload);
+  const rows = describeFields(
+    [current.payload, submitted.payload],
+    [definitions.current, definitions.submitted]
+  );
   const differs = differingFields(current.payload, submitted.payload);
 
   return (
@@ -131,13 +151,19 @@ function VersionCompare({ conflict }) {
         {submitted.collidedWithVersion}
       </span>
 
-      {fields.map((field) => {
-        const tint = differs.has(field) ? styles.differs : undefined;
+      {/* Two copies may come from two versions of the form. Shown, because it
+          explains a field that one side has and the other never asked. */}
+      <span style={styles.muted}>Form version</span>
+      <span>v{current.formVersion}</span>
+      <span>v{submitted.formVersion}</span>
+
+      {rows.map(({ key, label, field }) => {
+        const tint = differs.has(key) ? styles.differs : undefined;
         return (
-          <Fragment key={field}>
-            <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
-            <span style={tint}>{showValue(current.payload?.[field] ?? null)}</span>
-            <span style={tint}>{showValue(submitted.payload?.[field] ?? null)}</span>
+          <Fragment key={key}>
+            <span style={styles.muted}>{label}</span>
+            <span style={tint}>{formatValue(field, current.payload?.[key] ?? null)}</span>
+            <span style={tint}>{formatValue(field, submitted.payload?.[key] ?? null)}</span>
           </Fragment>
         );
       })}
@@ -181,7 +207,15 @@ function VersionCompare({ conflict }) {
  * Inline rather than window.confirm(), for the reasons RemoveAccountPanel gives:
  * a browser dialog cannot show a table of values, and is dismissed by reflex.
  */
-function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onBack }) {
+function ReplacementPreview({
+  conflict,
+  definitions,
+  resolution,
+  result,
+  busy,
+  onConfirm,
+  onBack,
+}) {
   const { current, submitted } = conflict;
   const replaced = [...differingFields(current.payload, result)];
   const only = (payload) =>
@@ -221,6 +255,7 @@ function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onB
             rightLabel="Replaced with"
             left={only(current.payload)}
             right={only(result)}
+            definitions={[definitions.current, definitions.submitted]}
           />
         </>
       )}
@@ -289,7 +324,7 @@ function ReplacementPreview({ conflict, resolution, result, busy, onConfirm, onB
  * that was actually overwritten is nowhere on screen. An audit view that hides
  * the one thing a decision destroyed is worse than none.
  */
-function ReplacedByDecision({ conflict }) {
+function ReplacedByDecision({ conflict, definitions }) {
   if (conflict.resolution === "kept_server") return null;
 
   if (!conflict.superseded) {
@@ -311,6 +346,7 @@ function ReplacedByDecision({ conflict }) {
         rightLabel={`Now (v${conflict.current.version})`}
         left={conflict.superseded.payload}
         right={conflict.current.payload}
+        definitions={[definitions.superseded, definitions.current]}
       />
     </>
   );
@@ -320,30 +356,41 @@ function ReplacedByDecision({ conflict }) {
  * Field by field: pick a side for each, and the result becomes the new version.
  *
  * Every field starts on the server's value, so a supervisor who only wants one
- * answer from the worker's copy changes one thing. Undeclared fields the worker
- * sent — from a build newer than this form revision — are offered like any
- * other, because they are real answers from a real household and the server
- * stores them.
+ * answer from the worker's copy changes one thing.
+ *
+ * The merge stays on the RECORD's form version — the server checks it against
+ * that version and refuses any other key — so the rows are that version's
+ * fields. An answer the worker gave to a question only their newer version
+ * asks has nowhere to go in a merge; it is named below the grid, and keeping
+ * the worker's version is how to keep it.
  */
-function MergeEditor({ conflict, onCancel, onSubmit, busy, locked }) {
+function MergeEditor({ conflict, definitions, onCancel, onSubmit, busy, locked }) {
   // `locked` while the replacement preview is open. The preview describes the
   // picks as they were when Save was pressed; letting them change underneath it
   // would have the supervisor confirm one merge and send another.
   const frozen = busy || locked;
   const { current, submitted } = conflict;
-  const fields = unionFields(current.payload, submitted.payload);
+  const target = definitions.current;
+  // Without the record's definition on this device, the keys either copy holds
+  // are all there is to go on; the server still has the final say.
+  const rows = target
+    ? target.fields.map((field) => ({ key: field.key, label: field.label, field }))
+    : describeFields([current.payload, submitted.payload], [definitions.submitted]);
+  const keys = rows.map((row) => row.key);
   const differs = differingFields(current.payload, submitted.payload);
+  const dropped = describeFields([submitted.payload], [definitions.submitted]).filter(
+    ({ key }) => !keys.includes(key) && (submitted.payload?.[key] ?? null) !== null
+  );
 
   const [picks, setPicks] = useState(() =>
-    Object.fromEntries(fields.map((field) => [field, "server"]))
+    Object.fromEntries(keys.map((key) => [key, "server"]))
   );
 
   const build = () =>
     Object.fromEntries(
-      fields.map((field) => [
-        field,
-        (picks[field] === "worker" ? submitted.payload?.[field] : current.payload?.[field]) ??
-          null,
+      keys.map((key) => [
+        key,
+        (picks[key] === "worker" ? submitted.payload?.[key] : current.payload?.[key]) ?? null,
       ])
     );
 
@@ -351,7 +398,8 @@ function MergeEditor({ conflict, onCancel, onSubmit, busy, locked }) {
     <div>
       <p style={styles.muted}>
         Choose a side for each field. Fields the two versions disagree about are
-        tinted; the rest are identical either way.
+        tinted; the rest are identical either way. The merged record stays on form
+        version {current.formVersion}.
       </p>
 
       <div style={styles.mergeGrid}>
@@ -359,32 +407,42 @@ function MergeEditor({ conflict, onCancel, onSubmit, busy, locked }) {
         <span style={styles.head}>Server (v{current.version})</span>
         <span style={styles.head}>Worker</span>
 
-        {fields.map((field) => {
-          const tint = differs.has(field) ? styles.differs : undefined;
-          const pick = picks[field];
+        {rows.map(({ key, label, field }) => {
+          const tint = differs.has(key) ? styles.differs : undefined;
+          const pick = picks[key];
           return (
-            <Fragment key={field}>
-              <span style={styles.muted}>{FIELD_LABELS[field] ?? field}</span>
+            <Fragment key={key}>
+              <span style={styles.muted}>{label}</span>
               <button
                 type="button"
                 style={{ ...styles.pick, ...tint, ...(pick === "server" ? styles.chosen : {}) }}
-                onClick={() => setPicks((p) => ({ ...p, [field]: "server" }))}
+                onClick={() => setPicks((p) => ({ ...p, [key]: "server" }))}
                 disabled={frozen}
               >
-                {showValue(current.payload?.[field] ?? null)}
+                {formatValue(field, current.payload?.[key] ?? null)}
               </button>
               <button
                 type="button"
                 style={{ ...styles.pick, ...tint, ...(pick === "worker" ? styles.chosen : {}) }}
-                onClick={() => setPicks((p) => ({ ...p, [field]: "worker" }))}
+                onClick={() => setPicks((p) => ({ ...p, [key]: "worker" }))}
                 disabled={frozen}
               >
-                {showValue(submitted.payload?.[field] ?? null)}
+                {formatValue(field, submitted.payload?.[key] ?? null)}
               </button>
             </Fragment>
           );
         })}
       </div>
+
+      {dropped.length > 0 && (
+        <p style={styles.danger}>
+          The worker also answered{" "}
+          <strong>{dropped.map(({ label }) => label).join(", ")}</strong>, which form version{" "}
+          {current.formVersion} does not ask, so a merge cannot keep{" "}
+          {dropped.length === 1 ? "that answer" : "those answers"}. To keep{" "}
+          {dropped.length === 1 ? "it" : "them"}, keep the worker&apos;s version instead.
+        </p>
+      )}
 
       {!locked && (
         <p>
@@ -400,7 +458,8 @@ function MergeEditor({ conflict, onCancel, onSubmit, busy, locked }) {
   );
 }
 
-function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMerge }) {
+function ConflictCard({ conflict, catalog, onResolve, busy, merging, onMerge, onCancelMerge }) {
+  const definitions = definitionsOf(conflict, catalog);
   const open = conflict.status === "open";
   // A resolution that overwrites the record, waiting on the supervisor to see
   // what it replaces: { resolution, payload }. kept_server never lands here.
@@ -411,7 +470,7 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
 
   return (
     <li style={styles.card}>
-      <strong>{conflict.current.payload?.householdName || "(no name)"}</strong>{" "}
+      <strong>{summarise(conflict.current.payload, definitions.current)}</strong>{" "}
       <span style={styles.muted}>
         {conflict.areaName ? `${conflict.areaName} · ` : ""}
         record {short(conflict.recordId)} · {conflict.submitted.formType} · raised{" "}
@@ -431,9 +490,9 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
         </p>
       )}
 
-      <VersionCompare conflict={conflict} />
+      <VersionCompare conflict={conflict} definitions={definitions} />
 
-      {!open && <ReplacedByDecision conflict={conflict} />}
+      {!open && <ReplacedByDecision conflict={conflict} definitions={definitions} />}
 
       {open && !merging && !pending && (
         <p>
@@ -457,6 +516,7 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
       {open && merging && (
         <MergeEditor
           conflict={conflict}
+          definitions={definitions}
           busy={busy}
           locked={pending !== null}
           onCancel={onCancelMerge}
@@ -467,6 +527,7 @@ function ConflictCard({ conflict, onResolve, busy, merging, onMerge, onCancelMer
       {open && pending && (
         <ReplacementPreview
           conflict={conflict}
+          definitions={definitions}
           resolution={pending.resolution}
           // What the record's answers will be afterwards: the worker's copy
           // whole, or the supervisor's assembled merge.
@@ -492,6 +553,7 @@ export default function ConflictReviewScreen() {
   // Bumped by anything that wants the queue re-read: the Refresh button, and
   // every resolution, because resolving moves a row from one tab to the other.
   const [reloadToken, setReloadToken] = useState(0);
+  const catalog = useFormCatalog();
 
   const applyPage = useCallback((data, append) => {
     setConflicts((rows) => (append ? [...rows, ...data.conflicts] : data.conflicts));
@@ -515,6 +577,11 @@ export default function ConflictReviewScreen() {
   // handler that triggers the read, which is an event and may set state freely.
   useEffect(() => {
     let cancelled = false;
+    // The conflicts may name a form version published since this device last
+    // synced. This screen is online anyway, so the forms are asked for with
+    // every read; useFormCatalog picks them up when they land. A failure leaves
+    // the screen labelling such a version by its keys.
+    void refreshForms().catch(() => {});
     listConflicts({ status })
       .then((data) => {
         if (!cancelled) applyPage(data, false);
@@ -607,6 +674,7 @@ export default function ConflictReviewScreen() {
             <ConflictCard
               key={conflict.id}
               conflict={conflict}
+              catalog={catalog}
               busy={busyId === conflict.id}
               merging={mergingId === conflict.id}
               onMerge={(c) => setMergingId(c.id)}

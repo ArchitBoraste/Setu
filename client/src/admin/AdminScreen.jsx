@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, NetworkError, NotAuthenticatedError } from "../lib/api.js";
+import { NetworkError } from "../lib/api.js";
 import { normalisePhoneInput } from "../lib/phone.js";
 import { shortTime } from "../lib/time.js";
 import {
@@ -11,6 +11,8 @@ import {
   resetPassword,
   updateUser,
 } from "./adminService.js";
+import { OFFLINE_MESSAGE, describe, styles } from "./adminUi.js";
+import FormsPanel from "./FormsPanel.jsx";
 
 // Temporary admin screen, matching the rest of the app: minimal inline styling,
 // enough to manage users and areas without seed scripts. A teammate builds the
@@ -20,45 +22,6 @@ import {
 // out is the server: every /api/admin route checks the role in the verified
 // token and then asks the database whether the caller is still an active admin.
 
-const styles = {
-  section: { marginTop: "2rem", borderTop: "1px solid #ddd", paddingTop: "1rem" },
-  muted: { color: "#666", fontSize: 14 },
-  tabs: { display: "flex", gap: "0.5rem", margin: "0.5rem 0" },
-  card: {
-    border: "1px solid #ddd",
-    borderRadius: 4,
-    padding: "0.75rem",
-    marginBottom: "0.75rem",
-  },
-  inactive: { opacity: 0.6 },
-  form: {
-    border: "1px solid #ddd",
-    borderRadius: 4,
-    padding: "0.75rem",
-    margin: "0.5rem 0 1rem",
-  },
-  label: { display: "block", marginBottom: "0.5rem", fontSize: 14 },
-  field: { display: "block", width: "100%", padding: "0.4rem", marginTop: 2, boxSizing: "border-box" },
-  row: { display: "flex", gap: "0.5rem", flexWrap: "wrap", marginTop: "0.5rem" },
-  notice: (tone) => ({
-    padding: "0.5rem 0.75rem",
-    borderRadius: 4,
-    fontSize: 14,
-    border: `1px solid ${tone === "warn" ? "#b45309" : "#15803d"}`,
-    background: tone === "warn" ? "#fffbeb" : "#f0fdf4",
-    color: "#111",
-  }),
-  confirm: {
-    marginTop: "0.5rem",
-    padding: "0.5rem 0.75rem",
-    border: "1px solid #b91c1c",
-    borderRadius: 4,
-    background: "#fef2f2",
-    color: "#111",
-    fontSize: 14,
-  },
-};
-
 const ROLE_LABELS = {
   field_worker: "Field worker",
   supervisor: "Supervisor",
@@ -66,25 +29,6 @@ const ROLE_LABELS = {
 };
 
 const ROLES = Object.keys(ROLE_LABELS);
-
-const OFFLINE_MESSAGE = "Admin needs an internet connection.";
-
-// What the admin is told when a request fails. The server's own sentence when
-// it gave one — those are written for this screen (server/admin/adminRules.js).
-function describe(error) {
-  if (error instanceof NetworkError) {
-    // Not "nothing was changed": a request that timed out may have landed. The
-    // honest answer is to look again once there is a connection.
-    return `${OFFLINE_MESSAGE} Could not reach the server — reload once you are connected to see whether the change was saved.`;
-  }
-  if (error instanceof NotAuthenticatedError) {
-    return "This device has no session with the server. Sign out and sign in again while you have a connection.";
-  }
-  if (error instanceof ApiError && error.status === 403) {
-    return "Only an admin can do this. If your role was changed, sign out and sign in again.";
-  }
-  return error.message;
-}
 
 // Which form or card an action came from, so its outcome is drawn there.
 const NEW_USER = "user:new";
@@ -172,10 +116,13 @@ function CreateUserForm({ areas, busy, notice, onCreate }) {
       </label>
       <label style={styles.label}>
         Phone (their sign-in)
+        {/* autoComplete off: this is someone else's number. type="tel" alone
+            invites the browser to offer the admin's own. */}
         <input
           style={styles.field}
           type="tel"
           inputMode="numeric"
+          autoComplete="off"
           value={form.phone}
           onChange={set("phone")}
           required
@@ -705,12 +652,19 @@ function AdminPanels({ currentUserId }) {
         <button onClick={() => switchTab("areas")} disabled={tab === "areas"}>
           Areas ({data.areas.length})
         </button>
-        <button onClick={reload} disabled={busy}>
-          Refresh
+        <button onClick={() => switchTab("forms")} disabled={tab === "forms"}>
+          Forms
         </button>
+        {/* The forms tab reads its own list and has its own Refresh, so a
+            half-built draft is not thrown away by reloading users. */}
+        {tab !== "forms" && (
+          <button onClick={reload} disabled={busy}>
+            Refresh
+          </button>
+        )}
       </div>
 
-      {tab === "users" ? (
+      {tab === "users" && (
         <UsersPanel
           users={data.users}
           areas={data.areas}
@@ -719,9 +673,11 @@ function AdminPanels({ currentUserId }) {
           notice={notice}
           act={act}
         />
-      ) : (
+      )}
+      {tab === "areas" && (
         <AreasPanel areas={data.areas} busy={busy} notice={notice} act={act} />
       )}
+      {tab === "forms" && <FormsPanel />}
     </>
   );
 }
@@ -733,8 +689,8 @@ export default function AdminScreen({ currentUserId, online }) {
       <p style={styles.muted}>
         {/* Said up front, as the conflict screen does: this is one of the two
             places in the app that do not work offline. */}
-        Users and areas. Changes are made on the server straight away, so this needs a
-        connection.
+        Users, areas and forms. Changes are made on the server straight away, so this
+        needs a connection.
       </p>
       {/* navigator.onLine is trusted only in this direction. "Offline" means no
           network interface at all, so there is no point drawing forms. "Online"

@@ -21,6 +21,7 @@ import {
   validateResolutionQuery,
 } from "../sync/pullRules.js";
 import { SCOPE_KIND, scopeFor } from "../sync/scopeRules.js";
+import { FORM_TYPE_RE, definitionKey } from "../forms/formRules.js";
 import { SERVER_TIME_FORMAT } from "../sync/serverTime.js";
 
 const router = express.Router();
@@ -389,8 +390,37 @@ async function applyOne(conn, actor, incoming) {
   }
 }
 
-async function pushOne(conn, actor, item) {
-  const envelope = validateEnvelope(item);
+/**
+ * Every version, drafts included, of each form type the batch names — read
+ * once per push, not per record. A batch is up to 200 records from one phone,
+ * almost always of one form type, and definitions are a few KB each.
+ *
+ * Drafts are loaded so a record claiming one can be told it is a draft rather
+ * than "unknown". Filtered to well-formed form types first, so a garbage value
+ * never reaches the query; validateEnvelope rejects those records anyway.
+ */
+async function loadDefinitions(conn, organizationId, batch) {
+  const formTypes = [
+    ...new Set(
+      batch
+        .map((item) => item?.formType)
+        .filter((formType) => typeof formType === "string" && FORM_TYPE_RE.test(formType))
+    ),
+  ];
+  if (formTypes.length === 0) return new Map();
+
+  // mysql2 expands an array bound to IN (?) into a list of escaped values.
+  const [rows] = await conn.query(
+    `SELECT form_type AS formType, version, status, fields
+       FROM form_definitions
+      WHERE organization_id = ? AND form_type IN (?)`,
+    [organizationId, formTypes]
+  );
+  return new Map(rows.map((row) => [definitionKey(row.formType, row.version), row]));
+}
+
+async function pushOne(conn, actor, item, definitions) {
+  const envelope = validateEnvelope(item, definitions);
   if (envelope.error) {
     // id may be absent or garbage here, which is why it is echoed as-is: the
     // client matches results back to rows by it, and inventing one would orphan
@@ -453,9 +483,12 @@ router.post(
     // request on the server.
     const conn = await pool.getConnection();
     try {
+      // The caller's organisation from the verified token: a record is only
+      // ever checked against its own organisation's forms.
+      const definitions = await loadDefinitions(conn, req.user.organizationId, batch);
       const results = [];
       for (const item of batch) {
-        results.push(await pushOne(conn, req.user, item));
+        results.push(await pushOne(conn, req.user, item, definitions));
       }
       res.json({ results });
     } finally {

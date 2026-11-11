@@ -1,6 +1,6 @@
 import { Fragment } from "react";
-import { differingFields, unionFields } from "../lib/payload.js";
-import { FIELD_LABELS, showValue } from "../records/formFields.js";
+import { differingFields } from "../lib/payload.js";
+import { describeFields, formatValue } from "../forms/formRules.js";
 
 // Two payloads side by side, with the fields that actually differ tinted.
 //
@@ -10,6 +10,11 @@ import { FIELD_LABELS, showValue } from "../records/formFields.js";
 // preview, and a supervisor's record of what a past decision replaced. Four
 // slightly different answers to one question is how four answers start to
 // disagree.
+//
+// Labels and value formatting come from the definitions of the form versions
+// the two payloads were captured under, so a record from version 1 reads with
+// version 1's labels, and a yes/no reads "Yes", not "true". A key neither
+// definition declares (a version this device does not have) is shown by name.
 //
 // The tinting is not decoration. Nobody diffs twenty identical fields by eye,
 // and a worker or supervisor who cannot find the disagreement will either
@@ -35,12 +40,22 @@ const styles = {
  * @param {object}   props
  * @param {string}   props.leftLabel
  * @param {string}   props.rightLabel
- * @param {object}   props.left        a payload
- * @param {object}   props.right       a payload
- * @param {Array}    [props.extraRows] [label, leftCell, rightCell] rows, untinted
+ * @param {object}   props.left          a payload
+ * @param {object}   props.right         a payload
+ * @param {Array}    [props.definitions] the definitions to label by, in order of
+ *                                       preference (left's, then right's); nulls
+ *                                       are allowed for a version not on this device
+ * @param {Array}    [props.extraRows]   [label, leftCell, rightCell] rows, untinted
  */
-export default function CompareGrid({ leftLabel, rightLabel, left, right, extraRows = [] }) {
-  const fields = unionFields(left, right);
+export default function CompareGrid({
+  leftLabel,
+  rightLabel,
+  left,
+  right,
+  definitions = [],
+  extraRows = [],
+}) {
+  const rows = describeFields([left, right], definitions);
   const differs = differingFields(left, right);
 
   return (
@@ -49,13 +64,13 @@ export default function CompareGrid({ leftLabel, rightLabel, left, right, extraR
       <span style={styles.head}>{leftLabel}</span>
       <span style={styles.head}>{rightLabel}</span>
 
-      {fields.map((field) => {
-        const tint = differs.has(field) ? styles.differs : undefined;
+      {rows.map(({ key, label, field }) => {
+        const tint = differs.has(key) ? styles.differs : undefined;
         return (
-          <Fragment key={field}>
-            <span style={styles.label}>{FIELD_LABELS[field] ?? field}</span>
-            <span style={tint}>{showValue(left?.[field] ?? null)}</span>
-            <span style={tint}>{showValue(right?.[field] ?? null)}</span>
+          <Fragment key={key}>
+            <span style={styles.label}>{label}</span>
+            <span style={tint}>{formatValue(field, left?.[key] ?? null)}</span>
+            <span style={tint}>{formatValue(field, right?.[key] ?? null)}</span>
           </Fragment>
         );
       })}

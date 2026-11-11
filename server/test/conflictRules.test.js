@@ -8,6 +8,7 @@ import {
   planResolution,
 } from "../sync/conflictRules.js";
 import { REJECT_REASON } from "../sync/pushRules.js";
+import { HOUSEHOLD_SURVEY_V1 } from "../forms/householdSurveyV1.js";
 
 // When the record was first deleted, and this resolution's clock reading.
 const FIRST_DELETED_AT = "2026-09-20 11:05:42.318000";
@@ -35,12 +36,21 @@ function filedConflict(overrides = {}) {
   };
 }
 
+// The record's definition as the resolve route reads it from form_definitions.
+const V1_ROW = {
+  formType: "household_survey",
+  version: 1,
+  status: "published",
+  fields: HOUSEHOLD_SURVEY_V1.fields,
+};
+
 function plan(resolution, overrides = {}) {
   return planResolution({
     resolution,
     conflict: filedConflict(overrides.conflict),
     record: storedRecord(overrides.record),
     mergedPayload: overrides.mergedPayload,
+    recordDefinition: V1_ROW,
   });
 }
 
@@ -169,16 +179,43 @@ describe("planResolution: merging the two copies", () => {
 
   test("a merge is checked against the record's form revision, not the losing copy's", () => {
     // The record is on v1, which declares memberCount a number. The losing copy
-    // came from v2, which this server declares nothing about.
+    // came from v2, and its definition is not what the merge is held to.
     const result = plan(RESOLUTION.MERGED, { mergedPayload: { ...merged, memberCount: "6" } });
     assert.equal(result.error?.reason, REJECT_REASON.PAYLOAD);
     assert.match(result.error.message, /memberCount/);
   });
 
-  test("fields the record's revision does not declare survive a merge", () => {
+  // Reversed with form definitions: a merge stays on the record's version, so
+  // a field only the losing copy's version declares has nowhere to go. The
+  // review screen leaves such fields out and says so; keep-worker adopts them.
+  test("a field the record's revision does not declare is refused in a merge", () => {
     const withNewField = { ...merged, toiletAvailable: "yes" };
-    const { value } = plan(RESOLUTION.MERGED, { mergedPayload: withNewField });
-    assert.equal(value.write.payload.toiletAvailable, "yes");
+    const result = plan(RESOLUTION.MERGED, { mergedPayload: withNewField });
+    assert.equal(result.error?.reason, REJECT_REASON.PAYLOAD);
+    assert.match(result.error.message, /toiletAvailable/);
+  });
+
+  test("a merge is refused when the record's form version is not published here", () => {
+    for (const recordDefinition of [null, undefined, { ...V1_ROW, status: "draft" }]) {
+      const result = planResolution({
+        resolution: RESOLUTION.MERGED,
+        conflict: filedConflict(),
+        record: storedRecord(),
+        mergedPayload: merged,
+        recordDefinition,
+      });
+      assert.equal(result.error?.reason, REJECT_REASON.PAYLOAD, JSON.stringify(recordDefinition));
+    }
+  });
+
+  test("keeping the worker's copy needs no definition: it was validated when it was pushed", () => {
+    const result = planResolution({
+      resolution: RESOLUTION.KEPT_CLIENT,
+      conflict: filedConflict(),
+      record: storedRecord(),
+      recordDefinition: null,
+    });
+    assert.equal(result.error, undefined);
   });
 });
 

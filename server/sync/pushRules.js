@@ -6,8 +6,13 @@
 // a human, or thrown away. Separated like this it can be called with three
 // literals and asserted on.
 
-import { Buffer } from "node:buffer";
 import { canSeeRecord } from "./scopeRules.js";
+import {
+  FORM_TYPE_RE,
+  PAYLOAD_ERROR,
+  definitionKey,
+  validatePayload,
+} from "../forms/formRules.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -16,17 +21,18 @@ import { canSeeRecord } from "./scopeRules.js";
 // route-level parser cannot tighten it, because the global one has already run
 // by the time this router is reached. So the caps that matter here are on COUNT
 // and on per-record size, which together bound what one device can send.
+//
+// The per-record payload limits moved to forms/formRules.js with the payload
+// check itself, and are re-exported here because this is where callers and
+// tests have always found them.
 // ---------------------------------------------------------------------------
 export const MAX_BATCH_RECORDS = 200;
 
-// Real UTF-8 bytes of the payload's JSON text — what the JSON column stores —
-// not JavaScript string length. The two differ by up to 3x for exactly the
-// text this app exists to collect: a Devanagari character is one UTF-16 unit
-// and three UTF-8 bytes. Sized so a 65,536-character Devanagari payload
-// (about 196 KB) still fits.
-export const MAX_PAYLOAD_UTF8_BYTES = 256 * 1024;
-export const MAX_PAYLOAD_FIELDS = 200;
-export const MAX_STRING_LENGTH = 10_000;
+export {
+  MAX_PAYLOAD_FIELDS,
+  MAX_PAYLOAD_UTF8_BYTES,
+  MAX_STRING_LENGTH,
+} from "../forms/formRules.js";
 export const MAX_FORM_TYPE_LENGTH = 64; // matches records.form_type VARCHAR(64)
 export const MAX_FORM_VERSION = 10_000;
 
@@ -67,25 +73,18 @@ export const PUSH_OUTCOME = {
 // day branch on them, and a code survives being reworded.
 export const REJECT_REASON = {
   ENVELOPE: "invalid_envelope",
-  PAYLOAD: "invalid_payload",
-  TOO_LARGE: "too_large",
+  // The same codes validatePayload returns, so its errors pass through as-is.
+  PAYLOAD: PAYLOAD_ERROR.INVALID,
+  TOO_LARGE: PAYLOAD_ERROR.TOO_LARGE,
+  // The form version the record claims is not a published version of this
+  // organisation's form: never published, or still a draft.
+  UNKNOWN_FORM: "unknown_form",
   UNKNOWN_RECORD: "unknown_record",
   VERSION_AHEAD: "version_ahead",
   FORBIDDEN: "forbidden",
 };
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-// Deliberately narrow: lowercase identifiers only, so a form type can never
-// carry whitespace, punctuation, or anything that reads as markup downstream.
-const FORM_TYPE_RE = /^[a-z0-9_]{1,64}$/;
-
-// The only two shapes a date may take: a calendar date, or that date with a
-// time of day (seconds, fraction and offset optional). The groups capture the
-// date and each clock field so isRealDate can range-check them.
-const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const ISO_DATETIME_RE =
-  /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,6})?)?(?:Z|[+-](\d{2}):(\d{2}))?$/;
 
 /**
  * Stable JSON: object keys sorted, at every depth.
@@ -108,238 +107,39 @@ export function canonicalJson(value) {
 }
 
 // ---------------------------------------------------------------------------
-// Payload validation
-//
-// The rule being enforced is the one documented above createRecord() in
-// client/src/records/recordService.js: numbers as JSON numbers, an unanswered
-// field as null, dates as ISO 8601 strings, text and choices as strings.
-//
-// That rule is applied at capture, where the form knows which field is a count
-// and which is free text. Enforcing it again here needs the same knowledge, so
-// the checking happens at two levels:
-//
-//   every value     must be null, a finite number, or a string. This holds for
-//                   all forms, known or not, and is what stops an object, an
-//                   array or a boolean reaching a column.
-//
-//   declared field  additionally checked against its type below, which is what
-//                   catches "5" where a count belongs. A leaf-type check alone
-//                   cannot: a numeric string is a perfectly legal string.
-//
-// A type violation is a rejection, never a throw. One malformed record is one
-// worker's problem, not a reason to fail the other 49 records in the batch.
-// ---------------------------------------------------------------------------
-
-/**
- * What the server knows about the forms it has seen. Keyed by form type, then by
- * form version, because a field's TYPE is a property of one revision of a form —
- * that is the whole reason payloads are stored beside a form_version.
- *
- * This is a stand-in for the form builder's registry in a later step, not a
- * second source of truth: it declares types only, never labels or options.
- */
-const FORM_FIELD_TYPES = {
-  household_survey: {
-    1: {
-      householdName: "string",
-      memberCount: "number",
-      childrenUnderFive: "number",
-      visitDate: "date",
-      waterSource: "string",
-      notes: "string",
-    },
-  },
-};
-
-// Two things this deliberately does NOT do, because both would turn a routine
-// client change into a total collection outage in the field:
-//
-//   unknown keys are not rejected. A build that adds a field and forgets to bump
-//   the form version would otherwise have every push from every device refused,
-//   and nobody finds out until a supervisor asks why the week is empty. An
-//   undeclared key still faces the leaf-type check and is stored.
-//
-//   choice values are not checked for membership. Option lists are edited far
-//   more often than field types, and an answer of "Borewell" collected before the
-//   list grew is a real answer from a real household, not a validation error.
-function fieldTypesFor(formType, formVersion) {
-  return FORM_FIELD_TYPES[formType]?.[formVersion] ?? null;
-}
-
-function validateDeclaredField(key, value, type) {
-  // Unanswered is null for every type. "Nobody answered" and "answered zero" are
-  // different facts about a household, and only one of them is a measurement.
-  if (value === null) return null;
-
-  if (type === "number") {
-    return typeof value === "number"
-      ? null
-      : `field "${key}" must be a number, not a ${typeof value}`;
-  }
-  if (type === "date") {
-    return typeof value === "string" && isRealDate(value)
-      ? null
-      : `field "${key}" must be an ISO 8601 date string`;
-  }
-  return typeof value === "string"
-    ? null
-    : `field "${key}" must be a string, not a ${typeof value}`;
-}
-
-/**
- * A strict ISO 8601 date or date-time that names a moment which exists.
- *
- * Date.parse is never the judge of shape. V8 accepts almost anything — "5" is a
- * day in 2001, "09/22/2026" is a US-style date — so a string must match one of
- * the two ISO shapes above before its values are even looked at.
- */
-function isRealDate(text) {
-  if (ISO_DATE_RE.test(text)) return isCalendarDate(text);
-
-  const parts = ISO_DATETIME_RE.exec(text);
-  if (!parts) return false;
-
-  const [, date, hours, minutes, seconds = "00", offsetHours = "00", offsetMinutes = "00"] =
-    parts;
-  // Checked by hand rather than by parsing: V8 rolls "24:00" over into the next
-  // day instead of refusing it, the same way it rolls impossible dates forward.
-  return (
-    isCalendarDate(date) &&
-    Number(hours) <= 23 &&
-    Number(minutes) <= 59 &&
-    Number(seconds) <= 59 &&
-    Number(offsetHours) <= 23 &&
-    Number(offsetMinutes) <= 59
-  );
-}
-
-// new Date() reads a date-only ISO string as UTC midnight, so a real date
-// round-trips exactly. The round trip is what refuses an impossible one: V8
-// does not reject "2026-02-30" but rolls it forward to 2 March, and only a
-// month that cannot exist at all, such as "2026-13-01", fails to parse.
-function isCalendarDate(text) {
-  const parsed = new Date(text);
-  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === text;
-}
-
-function validatePayloadValue(key, value) {
-  if (value === null) return null;
-
-  if (typeof value === "number") {
-    // JSON itself cannot carry NaN or Infinity, but a hand-built body and any
-    // future non-JSON transport can, and both would land in the column as NULL
-    // or 0 — a measurement invented by the parser.
-    return Number.isFinite(value) ? null : `field "${key}" must be a finite number`;
-  }
-
-  if (typeof value === "string") {
-    if (value.length > MAX_STRING_LENGTH) {
-      return `field "${key}" is longer than ${MAX_STRING_LENGTH} characters`;
-    }
-    // Only strings SHAPED like an ISO date are date-checked. Free text that
-    // matches "2026-09-22" exactly is a date in every real form, and a note that
-    // merely contains a date is untouched by these anchors.
-    if (
-      (ISO_DATE_RE.test(value) || ISO_DATETIME_RE.test(value)) &&
-      !isRealDate(value)
-    ) {
-      return `field "${key}" is not a valid ISO 8601 date`;
-    }
-    return null;
-  }
-
-  // Booleans, objects and arrays are absent from the rule on purpose. Adding one
-  // is a change to the capture coercion, to this check, and to every stored row
-  // — exactly the kind of change that should not happen by accident.
-  return `field "${key}" must be null, a number or a string`;
-}
-
-export function validatePayload(formType, formVersion, payload) {
-  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-    return {
-      error: { reason: REJECT_REASON.PAYLOAD, message: "payload must be an object" },
-    };
-  }
-
-  const keys = Object.keys(payload);
-  if (keys.length > MAX_PAYLOAD_FIELDS) {
-    return {
-      error: {
-        reason: REJECT_REASON.TOO_LARGE,
-        message: `payload has more than ${MAX_PAYLOAD_FIELDS} fields`,
-      },
-    };
-  }
-
-  const declared = fieldTypesFor(formType, formVersion);
-
-  for (const key of keys) {
-    // Messages name the field but never quote the value: a rejection is logged
-    // and shown on screen, and the value is a real household's data.
-    const problem =
-      validatePayloadValue(key, payload[key]) ??
-      (declared?.[key]
-        ? validateDeclaredField(key, payload[key], declared[key])
-        : null);
-    if (problem) {
-      return { error: { reason: REJECT_REASON.PAYLOAD, message: problem } };
-    }
-  }
-
-  const text = JSON.stringify(payload);
-  if (Buffer.byteLength(text, "utf8") > MAX_PAYLOAD_UTF8_BYTES) {
-    return {
-      error: {
-        reason: REJECT_REASON.TOO_LARGE,
-        message: `payload is larger than ${MAX_PAYLOAD_UTF8_BYTES} bytes`,
-      },
-    };
-  }
-
-  return { value: { payload, payloadText: text } };
-}
-
-// ---------------------------------------------------------------------------
 // Envelope validation
 //
-// FORM VERSION POLICY: the server accepts and stores any well-formed
-// form_version. It does not reject versions it "does not know".
+// FORM VERSION POLICY: a record must claim a PUBLISHED version of one of its
+// organisation's forms, and its answers must fit that version exactly.
 //
-// Two reasons, in order of weight.
+// This used to be the opposite — any well-formed version was stored, and only
+// the versions the server happened to know were checked — because a phone
+// could be ahead of the server, and refusing its answers would have destroyed
+// field data. Form definitions removed that case. A phone captures only
+// against versions the server published and sent it, and a published version
+// never changes or disappears, so every version a legitimate phone can claim is
+// one the server can check. A version it does not know is a hand-made request
+// or a bug, and the time to say so is the push, while the worker who captured
+// the record still has it in front of them.
 //
-// 1. Rejecting would destroy field data. A phone can be three releases behind
-//    for a month — no signal, no store, no charger. Its records are household
-//    visits that have already happened. Refusing them leaves those rows pending
-//    on a device forever, and a device is a thing that gets lost, wiped, or
-//    handed to the next worker. An unknown form version is a reason to read a
-//    payload carefully; it is never a reason to lose it.
+// A draft is refused by name, apart from "not published", because it is the
+// one mistake an admin can make on purpose and should be told about plainly.
 //
-// 2. The server does not interpret payloads on push. It stores the answers
-//    beside the form_version that produced them, which is precisely what makes
-//    them interpretable later. Validation of MEANING belongs at read and report
-//    time, where the reader can load the matching form definition — and there is
-//    no form registry on this server to validate against today in any case.
-//
-// The same argument runs in both directions: a version NEWER than anything the
-// server has seen is also stored, because a device ahead of the server is the
-// normal state during a staged rollout.
-//
-// What is still enforced is SHAPE — a positive integer within a sane bound — so
-// a tampered or corrupt value cannot reach the column.
-//
-// Knowing a form version is therefore not a gate but a LEVEL OF SCRUTINY. A
-// payload from a version in FORM_FIELD_TYPES is checked field by field; one from
-// a version the server has never heard of still has to pass the leaf-type check
-// and is then stored verbatim beside the version that produced it. Accepting
-// less than the server understands is the whole point: the alternative is
-// deciding that data collected on an older build never happened.
+// Payload rules live in forms/formRules.js. The definitions are loaded once
+// per push batch by the route and handed in, so this stays a pure function.
 // ---------------------------------------------------------------------------
 
 function isPositiveInt(value, max) {
   return Number.isInteger(value) && value >= 1 && value <= max;
 }
 
-export function validateEnvelope(item) {
+/**
+ * @param {*}   item         one record off the wire
+ * @param {Map} definitions  definitionKey(formType, version) -> the organisation's
+ *                           definition row { formType, version, status, fields },
+ *                           drafts included so a draft can be named as one
+ */
+export function validateEnvelope(item, definitions) {
   const fail = (message, reason = REJECT_REASON.ENVELOPE) => ({
     error: { reason, message },
   });
@@ -383,9 +183,17 @@ export function validateEnvelope(item) {
     return fail("deleted must be a boolean");
   }
 
-  // Checked after formType and formVersion, because which fields are declared —
-  // and therefore how strictly the payload is read — depends on both.
-  const payload = validatePayload(item.formType, item.formVersion, item.payload);
+  // Checked after the shape, so the lookup only ever sees a well-formed pair.
+  const form = `form ${item.formType} version ${item.formVersion}`;
+  const definition = definitions?.get(definitionKey(item.formType, item.formVersion));
+  if (!definition) {
+    return fail(`${form} is not published on the server`, REJECT_REASON.UNKNOWN_FORM);
+  }
+  if (definition.status !== "published") {
+    return fail(`${form} is a draft, not a published form`, REJECT_REASON.UNKNOWN_FORM);
+  }
+
+  const payload = validatePayload(definition, item.payload);
   if (payload.error) return payload;
 
   return {

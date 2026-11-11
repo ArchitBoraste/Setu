@@ -355,11 +355,22 @@ router.post(
           });
         }
 
+        // The definition a merge is checked against: the record's own version,
+        // read with the form identity just read under the lock. Not locked
+        // itself: a published definition never changes.
+        const [[recordDefinition]] = await conn.query(
+          `SELECT form_type AS formType, version, status, fields
+             FROM form_definitions
+            WHERE organization_id = ? AND form_type = ? AND version = ?`,
+          [record.organizationId, record.formType, record.formVersion]
+        );
+
         const plan = planResolution({
           resolution,
           conflict,
           record,
           mergedPayload: payload,
+          recordDefinition: recordDefinition ?? null,
         });
 
         if (plan.error) {

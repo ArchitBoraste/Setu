@@ -225,3 +225,40 @@ CREATE TABLE record_conflicts (
   CONSTRAINT fk_conflicts_resolver FOREIGN KEY (resolved_by)
     REFERENCES users (id) ON DELETE RESTRICT
 ) ENGINE=InnoDB;
+
+-- ============================================================
+-- Form definitions: one row per version of one form type in one organisation.
+-- What records.form_type + records.form_version point at, and what every
+-- payload is validated against. See migrations/006_form_definitions.sql.
+--
+--   draft       edited by an admin, never sent to a device; carries the version
+--               number it will be published as; at most one per form type.
+--   published   immutable, sent to every device, validated against for ever.
+--
+-- created_by NULL: a version nobody built in the admin screen (the household
+-- survey that was written into the app before definitions existed).
+--
+-- A fresh install gets household_survey version 1 from `npm run seed`
+-- (db/demoData.js); an existing database got it from migration 006.
+-- ============================================================
+CREATE TABLE form_definitions (
+  id              CHAR(36)     NOT NULL,
+  organization_id CHAR(36)     NOT NULL,
+  form_type       VARCHAR(64)  NOT NULL,          -- the slug records.form_type holds
+  version         INT          NOT NULL,          -- what records.form_version holds
+  title           VARCHAR(200) NOT NULL,
+  fields          JSON         NOT NULL,          -- [{ key, label, type, required, ... }]
+  status          ENUM('draft','published') NOT NULL DEFAULT 'draft',
+  created_by      CHAR(36)     NULL,
+  created_at      DATETIME(3)  NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  published_at    DATETIME(3)  NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_form_definitions_version (organization_id, form_type, version),
+  KEY idx_form_definitions_org_status (organization_id, status),
+  CONSTRAINT fk_form_definitions_org FOREIGN KEY (organization_id)
+    REFERENCES organizations (id) ON DELETE RESTRICT,
+  CONSTRAINT fk_form_definitions_user FOREIGN KEY (created_by)
+    REFERENCES users (id) ON DELETE RESTRICT,
+  CONSTRAINT chk_form_definitions_published
+    CHECK ((status = 'published') = (published_at IS NOT NULL))
+) ENGINE=InnoDB;

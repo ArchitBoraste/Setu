@@ -5,6 +5,7 @@ import authRoutes from "./routes/auth.js";
 import syncRoutes from "./routes/sync.js";
 import conflictRoutes from "./routes/conflicts.js";
 import adminRoutes from "./routes/admin.js";
+import formRoutes from "./routes/forms.js";
 
 // Last-resort visibility. `node --watch` clears the terminal when it restarts
 // a crashed process, so without these a fatal error can scroll away before it
@@ -71,6 +72,9 @@ app.get("/api/db-health", async (req, res) => {
 
 app.use("/api/auth", authRoutes);
 app.use("/api/sync", syncRoutes);
+// The published forms a device captures with. Any signed-in user; read at
+// sign-in and at the start of every sync, then used offline.
+app.use("/api/forms", formRoutes);
 // Mounted apart from /api/sync on purpose: these are a supervisor reviewing a
 // decision, not a device moving data, and unlike everything under /api/sync they
 // are online-only by design (see sync/conflictRules.js).

@@ -28,7 +28,8 @@
 // household visit passes through here.
 // ---------------------------------------------------------------------------
 
-import { REJECT_REASON, validatePayload } from "./pushRules.js";
+import { REJECT_REASON } from "./pushRules.js";
+import { validatePayload } from "../forms/formRules.js";
 
 // The three decisions, matching the record_conflicts.resolution ENUM exactly.
 export const RESOLUTION = {
@@ -103,8 +104,17 @@ function snapshotOf(record) {
  *                                     submittedDeleted is 1, 0 or null (not recorded)
  * @param {object} args.record         { formType, formVersion, payload, version }
  * @param {object} args.mergedPayload  the supervisor's assembled payload, for merged
+ * @param {object} [args.recordDefinition]  for merged: the definition row of the
+ *                                     record's (formType, formVersion),
+ *                                     { formType, version, status, fields }
  */
-export function planResolution({ resolution, conflict, record, mergedPayload }) {
+export function planResolution({
+  resolution,
+  conflict,
+  record,
+  mergedPayload,
+  recordDefinition,
+}) {
   const fail = (message, reason = RESOLVE_ERROR.INVALID) => ({
     error: { reason, message },
   });
@@ -171,11 +181,19 @@ export function planResolution({ resolution, conflict, record, mergedPayload }) 
   // Checked against the RECORD's form identity, not the conflict's, because a
   // merged payload is a new answer assembled by a supervisor rather than a
   // capture from either device, and the record's current revision is the one
-  // every device will read it under. Where the losing copy came from a newer
-  // build and carried fields this revision does not declare, they survive:
-  // validatePayload deliberately does not reject undeclared keys, for the reason
-  // written out beside fieldTypesFor().
-  const payload = validatePayload(record.formType, record.formVersion, mergedPayload);
+  // every device will read it under. A field that only the losing copy's
+  // version declares therefore cannot be merged in: it is not part of the
+  // version the record stays on. The review screen says so before the
+  // supervisor saves, and keep-worker remains the way to adopt that copy whole,
+  // form version and all.
+  if (recordDefinition?.status !== "published") {
+    return fail(
+      `form ${record.formType} version ${record.formVersion} is not published on the ` +
+        "server, so a merged version cannot be checked against it; keep one side whole instead",
+      RESOLVE_ERROR.PAYLOAD
+    );
+  }
+  const payload = validatePayload(recordDefinition, mergedPayload);
   if (payload.error) {
     return { error: payload.error };
   }

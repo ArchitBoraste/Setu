@@ -5,8 +5,9 @@ import { seedDemoData } from "./demoData.js";
 //
 // Deletes every collected record, every conflict and every refresh token — in
 // every organisation in this database, not only the demo one — and then runs
-// the seed. Users, organisations and areas are kept (the seed makes sure the
-// demo ones are right).
+// the seed. Users, organisations, areas and form definitions are kept (the seed
+// makes sure the demo ones are right, and that household_survey version 1 is
+// published).
 //
 // These are hard DELETEs, which the rest of the system never does to records:
 // a device that still holds a copy will never be told the row is gone. That is

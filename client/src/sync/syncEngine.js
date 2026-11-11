@@ -9,6 +9,7 @@ import { getDeviceId } from "../lib/device.js";
 import { samePayload } from "../lib/payload.js";
 import { SYNC_STATE } from "../records/syncState.js";
 import { belongsToPushQueue, canSeeRecord } from "../records/scope.js";
+import { refreshForms } from "./formSync.js";
 import {
   PULL_ACTION,
   RESOLUTION_ACTION,
@@ -619,8 +620,13 @@ function toResolutionNotice(user, resolution, discarded, local) {
       heldAsDeleted(local),
     discardedPayload: discarded ? discarded.payload : null,
     discardedVersion: discarded ? discarded.version : null,
+    // Which form version each kept copy was captured under, so the comparison
+    // labels it with that version's fields. Absent on notices written before
+    // form definitions; the screen falls back to the record's own version.
+    discardedFormVersion: discarded ? (discarded.formVersion ?? null) : null,
     supersededPayload: showSuperseded ? superseded.payload : null,
     supersededVersion: showSuperseded ? superseded.version : null,
+    supersededFormVersion: showSuperseded ? (superseded.formVersion ?? null) : null,
     // Device clock, and only ever used to order notices on screen.
     noticedAt: Date.now(),
   };
@@ -933,6 +939,18 @@ async function executeSync() {
   }
 
   try {
+    // FORMS FIRST, because the device is online now and a newly published
+    // version should reach the capture screen without waiting for a sign-in.
+    // Nothing below depends on it, so only a missing session stops the sync
+    // here; any other failure leaves the forms already stored, which stay
+    // valid, and push and pull go ahead and report the network themselves.
+    try {
+      await refreshForms();
+    } catch (error) {
+      if (error instanceof NotAuthenticatedError) throw error;
+      console.warn("[sync] forms not refreshed", error);
+    }
+
     // PUSH, THEN PULL. Not a preference — the other order silently destroys
     // work.
     //

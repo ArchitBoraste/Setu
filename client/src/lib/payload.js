@@ -2,11 +2,12 @@
 //
 // A shallow comparison is EXACT here, not an approximation, and that is worth
 // stating because it looks like a shortcut. Payload values are null, a finite
-// number, or a string — nothing else. That rule is applied at capture (see
-// createRecord in records/recordService.js) and enforced again on the server
-// (validatePayload in sync/pushRules.js), which rejects a boolean, an object or
-// an array outright. So there is nothing nested to recurse into, and `!==` over
-// the union of both key sets answers the question completely.
+// number, a string, or (for a yes/no field) a boolean — nothing else. That rule
+// is applied at capture (toPayload in forms/formRules.js) and enforced again on
+// the server (validatePayload in server/forms/formRules.js), which rejects an
+// object or an array in every field type. All four are primitives, so there is
+// nothing nested to recurse into, and `!==` over the union of both key sets
+// answers the question completely.
 //
 // If that rule ever changes, this file is one of the places that has to change
 // with it — which is exactly why the constraint is written down here rather than

@@ -25,12 +25,15 @@ export class NetworkError extends Error {
   }
 }
 
-// The server answered, and the answer was not 2xx.
+// The server answered, and the answer was not 2xx. `body` is the parsed
+// answer, for the screens that show more than its sentence — the form builder
+// puts each of a definition's problems next to the field it concerns.
 export class ApiError extends Error {
-  constructor(status, message) {
+  constructor(status, message, body = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -92,7 +95,8 @@ async function send(path, { method = "GET", body, accessToken } = {}) {
   if (!response.ok) {
     throw new ApiError(
       response.status,
-      data?.error ?? `Request failed (HTTP ${response.status})`
+      data?.error ?? `Request failed (HTTP ${response.status})`,
+      data
     );
   }
   return data;

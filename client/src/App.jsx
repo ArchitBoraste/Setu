@@ -11,6 +11,7 @@ import RemoveAccountPanel from "./records/RemoveAccountPanel.jsx";
 import ConflictReviewScreen from "./conflicts/ConflictReviewScreen.jsx";
 import AdminScreen from "./admin/AdminScreen.jsx";
 import { DATABASE_OUTDATED_EVENT } from "./db/index.js";
+import { refreshForms } from "./sync/formSync.js";
 
 // Temporary screen that proves the auth flow works. The real UI replaces it.
 
@@ -198,7 +199,15 @@ export default function App() {
   }
 
   const handleLogin = (phone, password) =>
-    run(async () => setSession(await login(phone, password)));
+    run(async () => {
+      const result = await login(phone, password);
+      setSession(result);
+      // An online sign-in is a moment the server is reachable, so the forms
+      // come down now rather than at the first sync. Not awaited: signing in
+      // must not wait on it, and capture already works with whatever forms the
+      // phone holds (or the built-in one).
+      if (result.mode === "online") void refreshForms().catch(() => {});
+    });
 
   const handleSignOut = () =>
     run(async () => {
